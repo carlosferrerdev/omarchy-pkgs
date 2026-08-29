@@ -15,6 +15,7 @@ set -e
 
 BUILD_ROOT=$(realpath "${BASH_SOURCE[0]%/*}/..")
 source "$BUILD_ROOT/helpers/message-helpers.sh"
+source "$BUILD_ROOT/helpers/publish-helpers.sh"
 
 CHECK_ONLY=false
 SKIP_TIMERS=false
@@ -266,17 +267,27 @@ echo ""
 # These hold secrets, so setup reports on them rather than creating them.
 print_info "Checking credentials..."
 
-if [[ -f "$CREDENTIALS" ]]; then
-  print_success "Signing credentials present: $CREDENTIALS"
+credentials_loaded=false
+credentials_valid=false
+if [[ -f "$CREDENTIALS" ]] && source "$CREDENTIALS"; then
+  credentials_loaded=true
+  if credentials_file_exports "$CREDENTIALS" \
+    GPG_PRIVATE_KEY GPG_PASSPHRASE OMARCHY_PKGS_RCLONE_DEST; then
+    credentials_valid=true
+    print_success "exported release credentials present: $CREDENTIALS"
+  else
+    print_warning "$CREDENTIALS does not export every required release credential"
+    print_warning "Assignments without export are invisible to timers and SSH child processes"
+  fi
 else
-  print_warning "Missing $CREDENTIALS"
-  echo "    Must export GPG_PRIVATE_KEY and GPG_PASSPHRASE; the release"
-  echo "    services source it before signing."
+  print_warning "Missing or unreadable $CREDENTIALS"
 fi
+echo "    It must export GPG_PRIVATE_KEY, GPG_PASSPHRASE, and"
+echo "    OMARCHY_PKGS_RCLONE_DEST; release services source it before publishing."
 
 # Release reporting is optional, but silence is indistinguishable from a
 # broken hook, so say which chat (if any) will receive build reports.
-if [[ -f "$CREDENTIALS" ]]; then
+if [[ "$credentials_loaded" == true ]]; then
   if grep -q 'OMARCHY_RELEASE_CHATBOT_URL' "$CREDENTIALS"; then
     print_success "Release reports go to the dedicated release chat"
   elif grep -q 'BASECAMP_CHATBOT_URL' "$CREDENTIALS"; then
@@ -292,11 +303,19 @@ if [[ -f "$CREDENTIALS" ]]; then
   fi
 fi
 
-if rclone listremotes 2>/dev/null | grep -q '^pkgs.omarchy.org:'; then
-  print_success "rclone remote 'pkgs.omarchy.org' configured"
+publish_destination=""
+if [[ "$credentials_valid" == true ]] &&
+  publish_destination=$(package_publish_destination 2>/dev/null); then
+  publish_remote="${publish_destination%%:*}:"
 else
-  print_warning "rclone remote 'pkgs.omarchy.org' not configured"
-  echo "    bin/repo sync publishes there; configure it with 'rclone config'."
+  publish_remote=""
+fi
+if [[ -n "$publish_remote" ]] && rclone listremotes 2>/dev/null | grep -Fxq "$publish_remote"; then
+  print_success "configured package destination is available: $publish_destination"
+else
+  print_warning "configured Gomarchy package destination is unavailable"
+  echo "    Export OMARCHY_PKGS_RCLONE_DEST in $CREDENTIALS and configure"
+  echo "    its rclone remote. No Omarchy production fallback is used."
 fi
 echo ""
 
