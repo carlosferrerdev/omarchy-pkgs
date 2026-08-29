@@ -21,14 +21,15 @@ source "$BUILD_ROOT/helpers/message-helpers.sh"
 source "$BUILD_ROOT/helpers/paths.sh"
 source "$BUILD_ROOT/helpers/host-helpers.sh"
 
-UPSTREAM_URL="${OMARCHY_UPSTREAM_URL:-https://github.com/basecamp/omarchy.git}"
-UPSTREAM_REPO="${OMARCHY_UPSTREAM_REPO:-basecamp/omarchy}"
-SITE_REPO="${OMARCHY_SITE_REPO:-omacom-io/omarchy-site}"
-ISO_REPO="${OMARCHY_ISO_REPO:-omacom-io/omarchy-iso}"
-DEV_BRANCH="${OMARCHY_DEV_BRANCH:-quattro}"
+UPSTREAM_URL="${OMARCHY_UPSTREAM_URL:-https://github.com/carlosferrerdev/prumo.git}"
+UPSTREAM_REPO="${OMARCHY_UPSTREAM_REPO:-carlosferrerdev/prumo}"
+PKGS_ORIGIN="${OMARCHY_PKGS_ORIGIN:-}"
+SITE_REPO="${OMARCHY_SITE_REPO:-}"
+ISO_REPO="${OMARCHY_ISO_REPO:-}"
+DEV_BRANCH="${OMARCHY_DEV_BRANCH:-gnome}"
 
-PKGS_DB_BASE="${OMARCHY_PKGS_DB_BASE:-https://pkgs.omarchy.org}"
-RC_DB_URL="$PKGS_DB_BASE/rc/x86_64/omarchy.db.tar.zst"
+PKGS_DB_BASE="${OMARCHY_PKGS_DB_BASE:-}"
+RC_DB_URL="${PKGS_DB_BASE:+$PKGS_DB_BASE/rc/x86_64/omarchy.db.tar.zst}"
 
 SRCDEST_DIR="$BUILD_ROOT/.srcdest"
 MIRROR_CLONE="$SRCDEST_DIR/omarchy"          # bare mirror (shared with bin/omarchy-pkgs)
@@ -37,6 +38,31 @@ RC_WORKTREE="$BUILD_ROOT/.worktrees/rc"      # pkgs repo rc branch worktree
 
 ASSUME_YES=false
 REPO_HOST_OVERRIDE=""
+
+require_release_config() {
+  local push_url missing=()
+  local push_urls=()
+  [[ -n "$PKGS_ORIGIN" ]] || missing+=(OMARCHY_PKGS_ORIGIN)
+  [[ -n "$PKGS_DB_BASE" ]] || missing+=(OMARCHY_PKGS_DB_BASE)
+  [[ -n "$SITE_REPO" ]] || missing+=(OMARCHY_SITE_REPO)
+  [[ -n "$ISO_REPO" ]] || missing+=(OMARCHY_ISO_REPO)
+  if (( ${#missing[@]} > 0 )); then
+    print_error "Gomarchy release infrastructure is not fully configured"
+    print_error "Set: ${missing[*]}"
+    print_error "Refusing to inherit any Omarchy production destination"
+    exit 1
+  fi
+
+  while IFS= read -r push_url; do
+    [[ -n "$push_url" ]] && push_urls+=("$push_url")
+  done < <(git -C "$BUILD_ROOT" remote get-url --push --all origin 2>/dev/null || true)
+  if (( ${#push_urls[@]} != 1 )) || [[ "${push_urls[0]:-}" != "$PKGS_ORIGIN" ]]; then
+    print_error "Package push origin mismatch: expected exactly '$PKGS_ORIGIN'"
+    print_error "Found ${#push_urls[@]} push destination(s): ${push_urls[*]:-<none>}"
+    print_error "Refusing to mutate release state in an unverified repository"
+    exit 1
+  fi
+}
 
 show_usage() {
   cat <<EOF
@@ -408,6 +434,7 @@ update_website() { # update_website <version>
 # --- commands ----------------------------------------------------------------
 
 cmd_start() {
+  require_release_config
   local version="${1:-}"
   if [[ -z "$version" ]]; then
     read -r -p "Version to release (X.Y.Z): " version
@@ -485,6 +512,7 @@ cmd_start() {
 }
 
 cmd_pick() {
+  require_release_config
   local branch version
   branch=$(open_train_branch) || true
   if [[ -z "$branch" ]]; then
@@ -498,9 +526,9 @@ cmd_pick() {
   git -C "$WORK_CLONE" checkout --quiet -B "$branch" "origin/$branch"
 
   # Changes usually reach a release branch as BACKPORTS — cherry-picks with
-  # new SHAs — so ancestry of the original quattro merge commit proves nothing
+  # new SHAs — so ancestry of the original development merge proves nothing
   # on a patch branch. Detect equivalence the way it is actually recorded:
-  # the branch's own commit messages since it left quattro name the PR
+  # the branch's own commit messages since it left the development branch name the PR
   # ("backport of #N", squash titles "(#N)") or the source commit
   # ("cherry picked from commit <sha>", which pick -x writes) — or, failing
   # both, repeat its title verbatim.
@@ -634,6 +662,7 @@ cmd_pick() {
 }
 
 cmd_rc() {
+  require_release_config
   local iso_mode="$1" wait="$2"
   local branch version
   branch=$(open_train_branch) || true
@@ -689,6 +718,7 @@ cmd_rc() {
 }
 
 cmd_ship() {
+  require_release_config
   local iso_mode="$1" wait="$2"
   local branch version
   branch=$(open_train_branch) || true
@@ -1018,12 +1048,45 @@ cmd_self_test() {
     fi
   }
   print_header "omarchy-release self-test"
+  local current_origin
+  current_origin=$(git -C "$BUILD_ROOT" remote get-url origin)
+  if (PKGS_ORIGIN="" PKGS_DB_BASE="" SITE_REPO="" ISO_REPO="" require_release_config) >/dev/null 2>&1; then
+    echo "  FAIL: missing release infrastructure accepted"
+    failures=$((failures + 1))
+  else
+    echo "  ok: missing release infrastructure rejected"
+  fi
+  if (PKGS_ORIGIN="https://packages.example/wrong.git" PKGS_DB_BASE="https://packages.example" SITE_REPO="example/site" ISO_REPO="example/iso" require_release_config) >/dev/null 2>&1; then
+    echo "  FAIL: mismatched package origin accepted"
+    failures=$((failures + 1))
+  else
+    echo "  ok: mismatched package origin rejected"
+  fi
+  if (PKGS_ORIGIN="$current_origin" PKGS_DB_BASE="https://packages.example" SITE_REPO="example/site" ISO_REPO="example/iso" require_release_config) >/dev/null 2>&1; then
+    echo "  ok: explicitly matched release infrastructure accepted"
+  else
+    echo "  FAIL: explicitly matched release infrastructure rejected"
+    failures=$((failures + 1))
+  fi
+  if (
+    export GIT_CONFIG_COUNT=2
+    export GIT_CONFIG_KEY_0=remote.origin.pushurl
+    export GIT_CONFIG_VALUE_0="$current_origin"
+    export GIT_CONFIG_KEY_1=remote.origin.pushurl
+    export GIT_CONFIG_VALUE_1=https://github.com/omacom/omarchy-pkgs.git
+    PKGS_ORIGIN="$current_origin" PKGS_DB_BASE="https://packages.example" SITE_REPO="example/site" ISO_REPO="example/iso" require_release_config
+  ) >/dev/null 2>&1; then
+    echo "  FAIL: multiple package push destinations accepted"
+    failures=$((failures + 1))
+  else
+    echo "  ok: multiple package push destinations rejected"
+  fi
   expect "version_to_branch 4.0.2" "$(version_to_branch 4.0.2)" "v4-0-2"
   expect "version_to_branch v4.1.0" "$(version_to_branch v4.1.0)" "v4-1-0"
   expect "version_to_branch garbage rejects" "$(version_to_branch 4.0 2>/dev/null || echo reject)" "reject"
   expect "branch_to_version v4-0-2" "$(branch_to_version v4-0-2)" "4.0.2"
   expect "branch_to_version v10-2-33" "$(branch_to_version v10-2-33)" "10.2.33"
-  expect "branch_to_version quattro rejects" "$(branch_to_version quattro 2>/dev/null || echo reject)" "reject"
+  expect "branch_to_version gnome rejects" "$(branch_to_version gnome 2>/dev/null || echo reject)" "reject"
   expect "version_is_patch 4.0.2" "$(version_is_patch 4.0.2 && echo yes || echo no)" "yes"
   expect "version_is_patch 4.1.0" "$(version_is_patch 4.1.0 && echo yes || echo no)" "no"
   expect "version_is_patch 5.0.0" "$(version_is_patch 5.0.0 && echo yes || echo no)" "no"
