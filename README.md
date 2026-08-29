@@ -58,13 +58,24 @@ bin/omarchy-release pick         # choose merged PRs to cherry-pick (multi-selec
 bin/omarchy-release rc           # publish the next 4.0.2rcN to the rc channel
 bin/omarchy-release ship         # final pins, promote rc → stable, tag,
                                  # GitHub release, ISO, website — one swoop
+bin/omarchy-release ship --resume-site
+                                 # verify an uploaded ISO marker and retry only the site
 bin/omarchy-release doctor       # verify credentials/connections up front
 ```
 
 Versions are inferred from branch names (`v4-0-2` ⇒ `4.0.2rcN` ⇒ tag
 `v4.0.2`); `start` is the only place a version is typed. Every command is
 idempotent — re-runs skip whatever is already done. `ship` refuses to promote
-a commit no RC was cut from.
+a commit no RC was cut from. Release gates fail closed: both pinned packages
+must be published at the same exact version before promotion, and ISO, website,
+or `master` failures leave a resumable train instead of reporting success.
+
+`--no-wait` queues a required package build and stops at that safe checkpoint;
+re-run the command after publication. It cannot be combined with `--iso`.
+Declining the ISO prompt also leaves the train incomplete—use `--no-iso` when
+skipping the ISO and website is an intentional release decision. If the ISO
+upload succeeded but the website step failed, use `ship --resume-site`; it
+verifies the immutable remote publication marker and never rebuilds the image.
 
 ### Full release
 
@@ -444,8 +455,10 @@ targets the current branch and edge.
 
 Release destinations deliberately have no Omarchy production defaults. Before
 any mutating release command, configure `OMARCHY_PKGS_ORIGIN`,
-`OMARCHY_PKGS_DB_BASE`, `OMARCHY_SITE_REPO`, and `OMARCHY_ISO_REPO` for the
-Gomarchy infrastructure. Direct `bin/omarchy-pkgs release` calls also require
+`OMARCHY_PKGS_DB_BASE`, `OMARCHY_SITE_REPO`, `OMARCHY_ISO_REPO`, and
+`OMARCHY_ISO_RCLONE_DEST` for the Gomarchy infrastructure. The latter is the
+explicit rclone destination (for example `Gomarchy:gomarchy/`); there is no
+fallback to the upstream Omarchy bucket. Direct `bin/omarchy-pkgs release` calls also require
 `OMARCHY_EDGE_DB_URL`; `--no-push` and `--dry-run` skip only the package-origin
 check, never the channel-database check.
 
