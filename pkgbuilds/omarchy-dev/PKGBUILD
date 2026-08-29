@@ -1,7 +1,7 @@
 # Maintainer: Ryan Hughes <ryan@omarchy.org>
 pkgname='omarchy-dev'
 pkgver=4.0.0.r6194.g1b56482
-pkgrel=1
+pkgrel=2
 _pkgver_base=4.0.0
 pkgdesc='Opinionated GNOME desktop experience for Arch Linux developers (gnome branch tip)'
 arch=('any')
@@ -27,13 +27,6 @@ depends=(
   'limine-mkinitcpio-hook'
   'limine-snapper-sync'
   'snapper'
-
-  # Wayland / Hyprland core
-  'hyprland'
-  'quickshell'
-  'uwsm'
-  'sddm'
-  'xdg-desktop-portal-hyprland'
 
   # Audio / auth / portal essentials
   'wireplumber'
