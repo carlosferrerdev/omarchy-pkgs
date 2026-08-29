@@ -1818,6 +1818,58 @@ cmd_self_test() {
   ) >/dev/null 2>&1 || test_status=$?
   expect "site resume verifies without rebuilding ISO" "$test_status" "0"
 
+  # Exercise the orchestration boundaries, not only the individual helpers.
+  # A call log makes an accidental fall-through into an irreversible step
+  # observable without touching a network, repository, or package channel.
+  local state_log state_commit=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+  state_log=$(mktemp) || exit 1
+  test_status=0
+  (
+    require_release_config() { :; }
+    open_train_branch() { echo v4-0-1; }
+    branch_head() { echo "$state_commit"; }
+    rc_branch_pin() { echo "4.0.1 2 $state_commit"; }
+    resolve_tag_commit() { :; }
+    published_version() {
+      case "$1" in
+      rc) echo 4.0.1-3 ;; # same pkgver, wrong pkgrel: still unpublished
+      *) echo 4.0.0-1 ;;
+      esac
+    }
+    confirm() { return 0; }
+    trigger_rc_build() { echo trigger >>"$state_log"; }
+    host_advance() { echo forbidden:promote >>"$state_log"; return 91; }
+    ensure_mirror_clone() { echo forbidden:tag >>"$state_log"; return 92; }
+    sync_final_pins_to_master() { echo forbidden:master >>"$state_log"; return 93; }
+    publish_ship_extras() { echo forbidden:extras >>"$state_log"; return 94; }
+    cmd_ship no false
+  ) >/dev/null 2>&1 || test_status=$?
+  expect "ship --no-wait stops successfully at the build checkpoint" "$test_status" "0"
+  expect "ship --no-wait triggers only the exact pkgrel rebuild" "$(cat "$state_log")" "trigger"
+
+  : >"$state_log"
+  test_status=0
+  (
+    require_release_config() { :; }
+    open_train_branch() { echo v4-0-1; }
+    branch_head() { echo "$state_commit"; }
+    rc_branch_pin() { echo "4.0.1 2 $state_commit"; }
+    resolve_tag_commit() { echo "$state_commit"; }
+    cmd_resume_site() { printf 'resume:%s\n' "$*" >>"$state_log"; }
+    confirm() { echo forbidden:confirm >>"$state_log"; return 1; }
+    cut_pins() { echo forbidden:pin >>"$state_log"; return 91; }
+    trigger_rc_build() { echo forbidden:build >>"$state_log"; return 92; }
+    host_advance() { echo forbidden:promote >>"$state_log"; return 93; }
+    ensure_mirror_clone() { echo forbidden:tag >>"$state_log"; return 94; }
+    sync_final_pins_to_master() { echo forbidden:master >>"$state_log"; return 95; }
+    publish_ship_extras() { echo forbidden:extras >>"$state_log"; return 96; }
+    cmd_ship resume true
+  ) >/dev/null 2>&1 || test_status=$?
+  expect "ship --resume-site dispatches successfully" "$test_status" "0"
+  expect "ship --resume-site performs no release mutations" "$(cat "$state_log")" \
+    "resume:4.0.1 4.0.1 2 $state_commit $state_commit"
+  rm -f -- "$state_log"
+
   local checkout_test_dir
   checkout_test_dir=$(mktemp -d)
   git -C "$checkout_test_dir" init --quiet
