@@ -7,8 +7,8 @@ SCRIPT_DIR=$(realpath "${BASH_SOURCE[0]%/*}")
 BUILD_ROOT=$(realpath "$SCRIPT_DIR/..")
 source "$BUILD_ROOT/helpers/paths.sh"
 source "$BUILD_ROOT/helpers/lock-helpers.sh"
-
-acquire_release_lock || exit 1
+source "$BUILD_ROOT/helpers/message-helpers.sh"
+source "$BUILD_ROOT/helpers/publish-helpers.sh"
 
 # Only sync understands the publishing flags; sign, promote and update reject
 # unknown options outright, so they cannot be forwarded blindly.
@@ -30,6 +30,26 @@ while [[ $# -gt 0 ]]; do
     ;;
   esac
 done
+explicit_remote=""
+for ((i=0; i<${#SYNC_ARGS[@]}; i++)); do
+  if [[ ${SYNC_ARGS[$i]} == --remote ]]; then
+    explicit_remote=${SYNC_ARGS[$((i + 1))]:-}
+  fi
+done
+publish_destination=$(package_publish_destination "$explicit_remote") || exit 1
+if [[ -z $explicit_remote ]]; then
+  SYNC_ARGS+=(--remote "$publish_destination")
+fi
+if [[ " ${SYNC_ARGS[*]} " != *" --skip-prod-check "* ]]; then
+  confirm_package_publication "$publish_destination" "the prebuilt package set" || {
+    print_info "Upload cancelled before signing or promotion"
+    exit 3
+  }
+  SYNC_ARGS+=(--skip-prod-check)
+fi
+preflight_package_destination "$publish_destination" || exit $?
+
+acquire_release_lock || exit 1
 
 "$SCRIPT_DIR/repo" sign "${COMMON_ARGS[@]}"
 "$SCRIPT_DIR/repo" promote "${COMMON_ARGS[@]}"

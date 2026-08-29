@@ -16,6 +16,7 @@ source "$BUILD_ROOT/helpers/paths.sh"
 source "$BUILD_ROOT/helpers/lock-helpers.sh"
 source "$BUILD_ROOT/helpers/package-metadata.sh"
 source "$BUILD_ROOT/helpers/basecamp-notifier.sh"
+source "$BUILD_ROOT/helpers/publish-helpers.sh"
 
 FROM=""
 TO=""
@@ -41,8 +42,8 @@ usage() {
   echo "  --fast-ring           Restrict to fast-ring packages (stable -> rc parity copy)"
   echo "  --bootstrap           One-time stable -> rc seed before forward-only enforcement"
   echo "  --dry-run             Preview without changing files"
-  echo "  --sync-remote <path>  Rclone remote for sync (default: pkgs.omarchy.org:omarchy-pkgs)"
-  echo "  --skip-prod-check     Skip production confirmation during sync"
+  echo "  --sync-remote <path>  Rclone destination (else \$OMARCHY_PKGS_RCLONE_DEST)"
+  echo "  --skip-prod-check     Skip publication confirmation during sync"
   echo "  -h, --help            Show this help message"
   echo ""
   echo "What it does:"
@@ -133,6 +134,18 @@ case "$FROM->$TO" in
   exit 1
   ;;
 esac
+
+if [[ "$DRY_RUN" != true ]]; then
+  SYNC_REMOTE=$(package_publish_destination "$SYNC_REMOTE") || exit 1
+  if [[ "$SKIP_PROD_CHECK" != true ]]; then
+    confirm_package_publication "$SYNC_REMOTE/$TO/$ARCH" "$FROM -> $TO promotion" || {
+      print_info "Advance cancelled before copying or publishing packages"
+      exit 3
+    }
+    SKIP_PROD_CHECK=true
+  fi
+  preflight_package_destination "$SYNC_REMOTE/$TO/$ARCH" || exit $?
+fi
 
 SOURCE_DIR="$REPO_ROOT/$FROM/$ARCH"
 TARGET_DIR="$REPO_ROOT/$TO/$ARCH"
@@ -320,7 +333,7 @@ print_info "Updating $TO repository database..."
 echo ""
 print_info "Syncing $TO repository to remote..."
 SYNC_ARGS=("--mirror" "$TO" "--arch" "$ARCH")
-[[ -n "$SYNC_REMOTE" ]] && SYNC_ARGS+=("--remote" "$SYNC_REMOTE")
+SYNC_ARGS+=("--remote" "$SYNC_REMOTE")
 [[ "$SKIP_PROD_CHECK" == true ]] && SYNC_ARGS+=("--skip-prod-check")
 "$BUILD_ROOT/bin/sync-repo" "${SYNC_ARGS[@]}" || {
   print_error "Sync failed"
@@ -350,7 +363,10 @@ if ((COPIED > 0)); then
   else
     label="Promoted $FROM → $TO"
     [[ "$BOOTSTRAP" == true ]] && label="Bootstrapped the $TO channel from $FROM"
-    notify_info "$label" \
-      "Arch: $ARCH · $(hostname -s 2>/dev/null || echo host)<br><strong>$COPIED package(s) moved:</strong>$moved<br><br>Live at https://pkgs.omarchy.org/$TO/$ARCH/"
+    publication="Arch: $ARCH · $(hostname -s 2>/dev/null || echo host)<br><strong>$COPIED package(s) moved:</strong>$moved"
+    if [[ -n ${OMARCHY_PKGS_PUBLIC_BASE:-} ]]; then
+      publication+="<br><br>Live at ${OMARCHY_PKGS_PUBLIC_BASE%/}/$TO/$ARCH/"
+    fi
+    notify_info "$label" "$publication"
   fi
 fi

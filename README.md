@@ -455,10 +455,11 @@ targets the current branch and edge.
 
 Release destinations deliberately have no Omarchy production defaults. Before
 any mutating release command, configure `OMARCHY_PKGS_ORIGIN`,
-`OMARCHY_PKGS_DB_BASE`, `OMARCHY_SITE_REPO`, `OMARCHY_ISO_REPO`, and
-`OMARCHY_ISO_RCLONE_DEST` for the Gomarchy infrastructure. The latter is the
-explicit rclone destination (for example `Gomarchy:gomarchy/`); there is no
-fallback to the upstream Omarchy bucket. Direct `bin/omarchy-pkgs release` calls also require
+`OMARCHY_PKGS_DB_BASE`, `OMARCHY_PKGS_RCLONE_DEST`, `OMARCHY_SITE_REPO`,
+`OMARCHY_ISO_REPO`, and `OMARCHY_ISO_RCLONE_DEST` for the Gomarchy
+infrastructure. The two rclone destinations are explicit (for example,
+`Gomarchy:packages/` and `Gomarchy:iso/`); neither package nor ISO publication
+has a fallback to an upstream Omarchy bucket. Direct `bin/omarchy-pkgs release` calls also require
 `OMARCHY_EDGE_DB_URL`; `--no-push` and `--dry-run` skip only the package-origin
 check, never the channel-database check.
 
@@ -875,7 +876,12 @@ bin/repo setup --skip-timers   # Prepare the host without the release timers
 ```
 
 Signing credentials (`/root/.omarchy/build-credentials`) and the rclone remote
-hold secrets, so setup reports on them rather than creating them.
+hold secrets, so setup reports on them rather than creating them. The same file
+must export `OMARCHY_PKGS_RCLONE_DEST`; `bin/repo release`, `advance`, `sync`,
+and `upload-prebuilt` validate the configured remote before lock, build,
+signing, or promotion. Variables must use `export`, because timers and SSH
+forwarding run child processes. An explicit `--remote` remains available for
+deliberate one-off destinations.
 
 ### Management
 

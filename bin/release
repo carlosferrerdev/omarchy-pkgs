@@ -8,6 +8,7 @@ source "$BUILD_ROOT/helpers/message-helpers.sh"
 source "$BUILD_ROOT/helpers/paths.sh"
 source "$BUILD_ROOT/helpers/lock-helpers.sh"
 source "$BUILD_ROOT/helpers/basecamp-notifier.sh"
+source "$BUILD_ROOT/helpers/publish-helpers.sh"
 
 SYNC_REMOTE=""
 SKIP_PROD_CHECK=false
@@ -65,9 +66,9 @@ while [[ $# -gt 0 ]]; do
     echo "  --arch <arch>         Target architecture (x86_64 or aarch64, default: x86_64)"
     echo "  --mirror <mirror>     Mirror to use (edge, rc, or stable, default: edge)"
     echo "  --package <name>      Build only the specified package"
-    echo "  --sync-remote <path>  Rclone remote for sync (default: pkgs.omarchy.org:omarchy-pkgs)"
-    echo "  --skip-prod-check     Skip production environment check during sync
-  --dry-run             Show build plan only; do not sign/promote/clean/update/sync"
+    echo "  --sync-remote <path>  Rclone destination (else \$OMARCHY_PKGS_RCLONE_DEST)"
+    echo "  --skip-prod-check     Skip publication confirmation during sync"
+    echo "  --dry-run             Show build plan only; do not sign/promote/clean/update/sync"
     echo "  -h, --help            Show this help message"
     echo ""
     echo "This script runs the complete workflow:"
@@ -80,6 +81,17 @@ while [[ $# -gt 0 ]]; do
     ;;
   esac
 done
+if [[ "$DRY_RUN" != true ]]; then
+  SYNC_REMOTE=$(package_publish_destination "$SYNC_REMOTE") || exit 1
+  if [[ "$SKIP_PROD_CHECK" != true ]]; then
+    confirm_package_publication "$SYNC_REMOTE/$MIRROR/$ARCH" "the $MIRROR package release" || {
+      print_info "Release cancelled before build, signing, or promotion"
+      exit 3
+    }
+    SKIP_PROD_CHECK=true
+  fi
+  preflight_package_destination "$SYNC_REMOTE/$MIRROR/$ARCH" || exit $?
+fi
 
 echo ""
 print_info "Target architecture: $ARCH"
@@ -186,9 +198,7 @@ print_info "Step 5/6: Updating repository database..."
 echo ""
 print_info "Step 6/6: Syncing to remote..."
 SYNC_ARGS=("--mirror" "$MIRROR" "--arch" "$ARCH")
-if [[ -n "$SYNC_REMOTE" ]]; then
-  SYNC_ARGS+=("--remote" "$SYNC_REMOTE")
-fi
+SYNC_ARGS+=("--remote" "$SYNC_REMOTE")
 if [[ "$SKIP_PROD_CHECK" == true ]]; then
   SYNC_ARGS+=("--skip-prod-check")
 fi
@@ -203,7 +213,9 @@ summary="$RELEASE_CONTEXT<br>Duration: $duration"
 if ((BUILT_COUNT > 0)); then
   summary+="<br><br><strong>$BUILT_COUNT package(s) published:</strong>"
   summary+="$(format_package_list_html "$BUILT_FILES")"
-  summary+="<br><br>Live at https://pkgs.omarchy.org/$MIRROR/$ARCH/"
+  if [[ -n ${OMARCHY_PKGS_PUBLIC_BASE:-} ]]; then
+    summary+="<br><br>Live at ${OMARCHY_PKGS_PUBLIC_BASE%/}/$MIRROR/$ARCH/"
+  fi
   notify_success "Release published: $MIRROR" "$summary"
 else
   # Rare by construction: a release only runs when the version check queued

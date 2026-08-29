@@ -20,6 +20,7 @@ BUILD_ROOT=$(realpath "${BASH_SOURCE[0]%/*}/..")
 source "$BUILD_ROOT/helpers/message-helpers.sh"
 source "$BUILD_ROOT/helpers/paths.sh"
 source "$BUILD_ROOT/helpers/host-helpers.sh"
+source "$BUILD_ROOT/helpers/publish-helpers.sh"
 
 UPSTREAM_URL="${OMARCHY_UPSTREAM_URL:-https://github.com/carlosferrerdev/prumo.git}"
 UPSTREAM_REPO="${OMARCHY_UPSTREAM_REPO:-carlosferrerdev/prumo}"
@@ -28,6 +29,7 @@ SITE_REPO="${OMARCHY_SITE_REPO:-}"
 ISO_REPO="${OMARCHY_ISO_REPO:-}"
 ISO_BRANCH="${OMARCHY_ISO_BRANCH:-quattro}"
 ISO_RCLONE_DEST="${OMARCHY_ISO_RCLONE_DEST:-}"
+PKGS_RCLONE_DEST="${OMARCHY_PKGS_RCLONE_DEST:-}"
 DEV_BRANCH="${OMARCHY_DEV_BRANCH:-gnome}"
 
 PKGS_DB_BASE="${OMARCHY_PKGS_DB_BASE:-}"
@@ -42,17 +44,56 @@ ASSUME_YES=false
 REPO_HOST_OVERRIDE=""
 
 require_release_config() {
-  local push_url missing=()
+  local push_url canonical_pkgs normalized_pkgs normalized_iso normalized_site
+  local db_authority db_host missing=()
   local push_urls=()
   [[ -n "$PKGS_ORIGIN" ]] || missing+=(OMARCHY_PKGS_ORIGIN)
   [[ -n "$PKGS_DB_BASE" ]] || missing+=(OMARCHY_PKGS_DB_BASE)
   [[ -n "$SITE_REPO" ]] || missing+=(OMARCHY_SITE_REPO)
   [[ -n "$ISO_REPO" ]] || missing+=(OMARCHY_ISO_REPO)
   [[ -n "$ISO_RCLONE_DEST" ]] || missing+=(OMARCHY_ISO_RCLONE_DEST)
+  [[ -n "$PKGS_RCLONE_DEST" ]] || missing+=(OMARCHY_PKGS_RCLONE_DEST)
   if (( ${#missing[@]} > 0 )); then
     print_error "Gomarchy release infrastructure is not fully configured"
     print_error "Set: ${missing[*]}"
     print_error "Refusing to inherit any Omarchy production destination"
+    exit 1
+  fi
+  package_publish_destination "$PKGS_RCLONE_DEST" >/dev/null || exit 1
+  if [[ ! "$PKGS_DB_BASE" =~ ^https://[A-Za-z0-9.-]+(:[0-9]+)?(/[A-Za-z0-9._~/-]*)?$ ]]; then
+    print_error "OMARCHY_PKGS_DB_BASE must be a Gomarchy-owned HTTPS base URL"
+    exit 1
+  fi
+  db_authority=${PKGS_DB_BASE#https://}
+  db_authority=${db_authority%%/*}
+  db_host=${db_authority%%:*}
+  db_host=$(tr '[:upper:]' '[:lower:]' <<<"$db_host") || exit 1
+  if [[ "$db_host" == "pkgs.omarchy.org" ]]; then
+    print_error "Refusing the upstream Omarchy package database"
+    exit 1
+  fi
+  [[ "$ISO_REPO" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || {
+    print_error "Invalid OMARCHY_ISO_REPO: $ISO_REPO"
+    exit 1
+  }
+  [[ "$SITE_REPO" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || {
+    print_error "Invalid OMARCHY_SITE_REPO: $SITE_REPO"
+    exit 1
+  }
+  normalized_iso=$(tr '[:upper:]' '[:lower:]' <<<"$ISO_REPO") || exit 1
+  normalized_site=$(tr '[:upper:]' '[:lower:]' <<<"$SITE_REPO") || exit 1
+  if [[ "$normalized_iso" == "omacom/omarchy-iso" || "$normalized_site" == omacom/* ]]; then
+    print_error "Refusing an upstream Omarchy ISO or website repository"
+    exit 1
+  fi
+  iso_publish_destination "$ISO_RCLONE_DEST" >/dev/null || exit 1
+  canonical_pkgs=$(canonical_github_repo "$PKGS_ORIGIN") || {
+    print_error "OMARCHY_PKGS_ORIGIN must be a canonical GitHub repository URL"
+    exit 1
+  }
+  normalized_pkgs=$(tr '[:upper:]' '[:lower:]' <<<"$canonical_pkgs") || exit 1
+  if [[ "$normalized_pkgs" == "omacom/omarchy-pkgs" ]]; then
+    print_error "Refusing the upstream Omarchy package Git repository"
     exit 1
   fi
 
@@ -572,6 +613,68 @@ iso_checkout() { # prints a usable omarchy-iso checkout, cloning to tmp if neede
   fi
   refresh_managed_iso_checkout "$tmp" || return $?
   echo "$tmp"
+}
+
+doctor_iso_release_source() {
+  local dir="" head remote_head refs
+  [[ "$ISO_REPO" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || return 1
+  refs=$(git ls-remote "https://github.com/$ISO_REPO.git" "refs/heads/$ISO_BRANCH") || return 1
+  remote_head=$(awk -v ref="refs/heads/$ISO_BRANCH" '$2 == ref { print $1 }' <<<"$refs")
+  [[ "$remote_head" =~ ^[0-9a-f]{40}$ ]] || return 1
+
+  if [[ -n ${OMARCHY_ISO_DIR:-} ]]; then
+    [[ -d "$OMARCHY_ISO_DIR" ]] || return 1
+    dir=$(realpath "$OMARCHY_ISO_DIR")
+  elif git -C "$BUILD_ROOT/../omarchy-iso" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    dir=$(realpath "$BUILD_ROOT/../omarchy-iso")
+  elif [[ -d "$SRCDEST_DIR/omarchy-iso" ]]; then
+    dir="$SRCDEST_DIR/omarchy-iso"
+  else
+    # A managed checkout will be cloned by the release. Proving the configured
+    # repository and branch exist is the complete read-only preflight here.
+    return 0
+  fi
+
+  validate_release_checkout "$dir" "$ISO_REPO" || return 1
+  head=$(git -C "$dir" rev-parse HEAD) || return 1
+  [[ "$head" == "$remote_head" ]]
+}
+
+doctor_package_destination() {
+  local host destination
+  destination=$(package_publish_destination "$PKGS_RCLONE_DEST") || return 1
+  if host=$(repo_host); then
+    ssh -o ConnectTimeout=10 "$host" "EXPECTED_DESTINATION='$destination'"'
+      set -e
+      unset OMARCHY_PKGS_RCLONE_DEST
+      source /root/.omarchy/build-credentials
+      env | grep -q "^OMARCHY_PKGS_RCLONE_DEST="
+      case "${OMARCHY_PKGS_RCLONE_DEST:-}" in pkgs.omarchy.org:*) exit 1 ;; esac
+      printf "%s\n" "${OMARCHY_PKGS_RCLONE_DEST:-}" |
+        grep -Eq "^[A-Za-z0-9._-]+:[A-Za-z0-9._~/-]+$"
+      test "$OMARCHY_PKGS_RCLONE_DEST" = "$EXPECTED_DESTINATION"
+      command -v rclone >/dev/null
+      rclone lsf "$OMARCHY_PKGS_RCLONE_DEST" --files-only --max-depth 1 >/dev/null
+    '
+  elif on_repo_host; then
+    command -v rclone >/dev/null 2>&1 || return 1
+    rclone lsf "$destination" --files-only --max-depth 1 >/dev/null
+  else
+    return 1
+  fi
+}
+
+doctor_iso_signing_credentials() {
+  local dir
+  dir=$(iso_checkout) || return 1
+  (cd "$dir" && bin/omarchy-iso-sign --preflight)
+}
+
+doctor_iso_publication_credentials() {
+  local dir
+  dir=$(iso_checkout) || return 1
+  (cd "$dir" && OMARCHY_ISO_RCLONE_DEST="$ISO_RCLONE_DEST" \
+    bin/omarchy-iso-upload --preflight)
 }
 
 build_iso() { # build_iso <version> [--rc]
@@ -1579,11 +1682,22 @@ cmd_doctor() {
       failures=$((failures + 1))
     fi
   }
+  release_config_preflight() { (require_release_config); }
   check "git available" command -v git
+  check "release infrastructure configured" release_config_preflight
   check "gh available" command -v gh
   check "gh authenticated" gh auth status
   check "gh can see $UPSTREAM_REPO" gh repo view "$UPSTREAM_REPO"
   check "gh can see $SITE_REPO" gh repo view "$SITE_REPO"
+  check "gh can see $ISO_REPO" gh repo view "$ISO_REPO"
+  check "ISO release source is exact origin/$ISO_BRANCH" doctor_iso_release_source
+  check "1Password CLI available" command -v op
+  check "GnuPG available" command -v gpg
+  check "rclone available" command -v rclone
+  check "ISO destination readable" rclone lsf "$ISO_RCLONE_DEST" --files-only --max-depth 1
+  check "ISO signing identity usable" doctor_iso_signing_credentials
+  check "ISO destination write/read/delete usable" doctor_iso_publication_credentials
+  check "package destination readable on the repository host" doctor_package_destination
   check "vercmp available (pacman)" command -v vercmp
   check "makepkg available (checksums)" command -v makepkg
   check "curl available" command -v curl
@@ -1639,19 +1753,24 @@ cmd_self_test() {
   print_header "omarchy-release self-test"
   local current_origin
   current_origin=$(git -C "$BUILD_ROOT" remote get-url origin)
-  if (PKGS_ORIGIN="" PKGS_DB_BASE="" SITE_REPO="" ISO_REPO="" ISO_RCLONE_DEST="" require_release_config) >/dev/null 2>&1; then
+  if (PKGS_ORIGIN="" PKGS_DB_BASE="" SITE_REPO="" ISO_REPO="" ISO_RCLONE_DEST="" PKGS_RCLONE_DEST="" require_release_config) >/dev/null 2>&1; then
     echo "  FAIL: missing release infrastructure accepted"
     failures=$((failures + 1))
   else
     echo "  ok: missing release infrastructure rejected"
   fi
-  if (PKGS_ORIGIN="https://packages.example/wrong.git" PKGS_DB_BASE="https://packages.example" SITE_REPO="example/site" ISO_REPO="example/iso" ISO_RCLONE_DEST="example:iso/" require_release_config) >/dev/null 2>&1; then
+  if (PKGS_ORIGIN="https://packages.example/wrong.git" PKGS_DB_BASE="https://packages.example" SITE_REPO="example/site" ISO_REPO="example/iso" ISO_RCLONE_DEST="example:iso/" PKGS_RCLONE_DEST="example:packages/" require_release_config) >/dev/null 2>&1; then
     echo "  FAIL: mismatched package origin accepted"
     failures=$((failures + 1))
   else
     echo "  ok: mismatched package origin rejected"
   fi
-  if (PKGS_ORIGIN="$current_origin" PKGS_DB_BASE="https://packages.example" SITE_REPO="example/site" ISO_REPO="example/iso" ISO_RCLONE_DEST="example:iso/" require_release_config) >/dev/null 2>&1; then
+  if (
+    export GIT_CONFIG_COUNT=1
+    export GIT_CONFIG_KEY_0=remote.origin.pushurl
+    export GIT_CONFIG_VALUE_0=git@github.com:example/packages.git
+    PKGS_ORIGIN=git@github.com:example/packages.git PKGS_DB_BASE="https://packages.example" SITE_REPO="example/site" ISO_REPO="example/iso" ISO_RCLONE_DEST="example:iso/" PKGS_RCLONE_DEST="example:packages/" require_release_config
+  ) >/dev/null 2>&1; then
     echo "  ok: explicitly matched release infrastructure accepted"
   else
     echo "  FAIL: explicitly matched release infrastructure rejected"
@@ -1663,13 +1782,71 @@ cmd_self_test() {
     export GIT_CONFIG_VALUE_0="$current_origin"
     export GIT_CONFIG_KEY_1=remote.origin.pushurl
     export GIT_CONFIG_VALUE_1=https://github.com/omacom/omarchy-pkgs.git
-    PKGS_ORIGIN="$current_origin" PKGS_DB_BASE="https://packages.example" SITE_REPO="example/site" ISO_REPO="example/iso" ISO_RCLONE_DEST="example:iso/" require_release_config
+    PKGS_ORIGIN="$current_origin" PKGS_DB_BASE="https://packages.example" SITE_REPO="example/site" ISO_REPO="example/iso" ISO_RCLONE_DEST="example:iso/" PKGS_RCLONE_DEST="example:packages/" require_release_config
   ) >/dev/null 2>&1; then
     echo "  FAIL: multiple package push destinations accepted"
     failures=$((failures + 1))
   else
     echo "  ok: multiple package push destinations rejected"
   fi
+  if (
+    PKGS_ORIGIN="$current_origin" PKGS_DB_BASE="https://pkgs.omarchy.org" SITE_REPO="omacom/omarchy.org" ISO_REPO="omacom/omarchy-iso" ISO_RCLONE_DEST="Omarchy:iso.omarchy.org" PKGS_RCLONE_DEST="pkgs.omarchy.org:omarchy-pkgs" require_release_config
+  ) >/dev/null 2>&1; then
+    echo "  FAIL: explicit upstream release infrastructure accepted"
+    failures=$((failures + 1))
+  else
+    echo "  ok: explicit upstream release infrastructure rejected"
+  fi
+  if (
+    export GIT_CONFIG_COUNT=1
+    export GIT_CONFIG_KEY_0=remote.origin.pushurl
+    export GIT_CONFIG_VALUE_0=https://github.com/OMACOM/OMARCHY-PKGS.git
+    PKGS_ORIGIN=https://github.com/OMACOM/OMARCHY-PKGS.git PKGS_DB_BASE="https://PKGS.OMARCHY.ORG" SITE_REPO="Omacom/omarchy.org" ISO_REPO="OMACOM/OMARCHY-ISO" ISO_RCLONE_DEST="example:iso/" PKGS_RCLONE_DEST="example:packages/" require_release_config
+  ) >/dev/null 2>&1; then
+    echo "  FAIL: mixed-case upstream release infrastructure accepted"
+    failures=$((failures + 1))
+  else
+    echo "  ok: mixed-case upstream release infrastructure rejected"
+  fi
+  expect "missing package publication destination rejected" \
+    "$( (print_error() { :; }; OMARCHY_PKGS_RCLONE_DEST= package_publish_destination) || echo reject)" "reject"
+  expect "upstream destination is rejected even when explicit" \
+    "$( (print_error() { :; }; package_publish_destination PKGS.OMARCHY.ORG:omarchy-pkgs) || echo reject)" "reject"
+  expect "explicit package publication destination accepted" \
+    "$(OMARCHY_PKGS_RCLONE_DEST= package_publish_destination Gomarchy:packages/)" "Gomarchy:packages/"
+  expect "local package publication path rejected" \
+    "$( (print_error() { :; }; package_publish_destination /srv/packages) || echo reject)" "reject"
+  expect "historical upstream ISO bucket rejected in isolation" \
+    "$( (print_error() { :; }; iso_publish_destination Omarchy:omarchy/) || echo reject)" "reject"
+  expect "historical upstream ISO hostname destination rejected in isolation" \
+    "$( (print_error() { :; }; iso_publish_destination oMaRcHy:ISO.OMARCHY.ORG/) || echo reject)" "reject"
+  expect "explicit Gomarchy ISO destination accepted" \
+    "$(iso_publish_destination Gomarchy:iso/)" "Gomarchy:iso/"
+  expect "non-canonical GitHub URL rejected" \
+    "$(canonical_github_repo https://github.com/example/packages.git/ 2>/dev/null || echo reject)" "reject"
+  test_status=0
+  (print_warning() { :; }; confirm_package_publication Gomarchy:packages <<<n) >/dev/null 2>&1 || test_status=$?
+  expect "declined package publication is incomplete" "$test_status" "3"
+  test_status=0
+  (print_warning() { :; }; confirm_package_publication Gomarchy:packages <<<y) >/dev/null 2>&1 || test_status=$?
+  expect "confirmed package publication proceeds" "$test_status" "0"
+  test_status=0
+  (rclone() { return 3; }; preflight_package_destination Gomarchy:packages/new) >/dev/null 2>&1 || test_status=$?
+  expect "missing first-publication prefix passes remote preflight" "$test_status" "0"
+  test_status=0
+  (rclone() { return 17; }; preflight_package_destination Gomarchy:packages) >/dev/null 2>&1 || test_status=$?
+  expect "package destination credential failure propagates" "$test_status" "17"
+  local credentials_fixture
+  credentials_fixture=$(mktemp) || exit 1
+  printf '%s\n' 'OMARCHY_PKGS_RCLONE_DEST=Gomarchy:packages' >"$credentials_fixture"
+  test_status=0
+  credentials_file_exports "$credentials_fixture" OMARCHY_PKGS_RCLONE_DEST >/dev/null 2>&1 || test_status=$?
+  expect "unexported credentials are invisible to service children" "$test_status" "1"
+  printf '%s\n' 'export OMARCHY_PKGS_RCLONE_DEST=Gomarchy:packages' >"$credentials_fixture"
+  test_status=0
+  credentials_file_exports "$credentials_fixture" OMARCHY_PKGS_RCLONE_DEST >/dev/null 2>&1 || test_status=$?
+  expect "exported credentials reach service children" "$test_status" "0"
+  rm -f -- "$credentials_fixture"
   expect "version_to_branch 4.0.2" "$(version_to_branch 4.0.2)" "v4-0-2"
   expect "version_to_branch v4.1.0" "$(version_to_branch v4.1.0)" "v4-1-0"
   expect "version_to_branch garbage rejects" "$(version_to_branch 4.0 2>/dev/null || echo reject)" "reject"
