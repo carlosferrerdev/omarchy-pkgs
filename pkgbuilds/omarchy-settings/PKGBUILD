@@ -146,6 +146,13 @@ package() {
   # ~/.config/mimeapps.list, and ~/.config/systemd/user can all override these.
   install -Dm644 default/uwsm/env.d/10-omarchy "$pkgdir/usr/share/uwsm/env.d/10-omarchy"
   install -Dm644 default/environment.d/10-omarchy-fcitx.conf "$pkgdir/usr/lib/environment.d/10-omarchy-fcitx.conf"
+  # GNOME session-mode quartet. The GNOME desktop ID stays distinct from the
+  # retained /usr/local Omarchy Hyprland session during the coexistence phase.
+  install -Dm644 default/gnome-shell/modes/gomarchy.json "$pkgdir/usr/share/gnome-shell/modes/gomarchy.json"
+  install -Dm644 default/gnome-session/sessions/gomarchy.session "$pkgdir/usr/share/gnome-session/sessions/gomarchy.session"
+  install -Dm644 default/wayland-sessions/gomarchy-gnome.desktop "$pkgdir/usr/share/wayland-sessions/gomarchy-gnome.desktop"
+  install -Dm644 default/systemd/user/gnome-session@gomarchy.target.d/gomarchy.session.conf \
+    "$pkgdir/usr/lib/systemd/user/gnome-session@gomarchy.target.d/gomarchy.session.conf"
   install -Dm644 default/fontconfig/conf.avail/50-omarchy.conf "$pkgdir/usr/share/fontconfig/conf.avail/50-omarchy.conf"
   install -d "$pkgdir/etc/fonts/conf.d"
   ln -sfn /usr/share/fontconfig/conf.avail/50-omarchy.conf "$pkgdir/etc/fonts/conf.d/50-omarchy.conf"
