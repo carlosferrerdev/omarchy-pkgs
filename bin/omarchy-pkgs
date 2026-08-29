@@ -668,6 +668,33 @@ cmd_self_test() {
 
   print_header "omarchy-pkgs self-test"
 
+  echo "Edition-neutral runtime dependencies:"
+  local package dependency runtime_dependencies package_neutral
+  local desktop_dependencies=(
+    hyprland quickshell uwsm sddm xdg-desktop-portal-hyprland
+  )
+  for package in omarchy omarchy-dev; do
+    package_neutral=true
+    runtime_dependencies=$(cd "$BUILD_ROOT/pkgbuilds/$package" &&
+      bash -c 'source PKGBUILD 2>/dev/null; printf "%s\n" "${depends[@]}"')
+    for dependency in "${desktop_dependencies[@]}"; do
+      if grep -Fxq -- "$dependency" <<<"$runtime_dependencies"; then
+        echo "  FAIL: $package hard-depends on desktop package $dependency"
+        failures=$((failures + 1))
+        package_neutral=false
+      fi
+    done
+    if [[ $package_neutral == true ]]; then
+      echo "  ok: $package leaves desktop selection to edition manifests"
+    fi
+  done
+  if guard_lockstep >/dev/null 2>&1; then
+    echo "  ok: stable runtime and settings release metadata remain in lockstep"
+  else
+    echo "  FAIL: stable runtime and settings release metadata diverged"
+    failures=$((failures + 1))
+  fi
+
   echo "Release destination guards:"
   if (EDGE_DB_URL="" require_release_config true false) >/dev/null 2>&1; then
     echo "  FAIL: missing channel database accepted"
