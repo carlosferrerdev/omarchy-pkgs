@@ -26,6 +26,8 @@ UPSTREAM_REPO="${OMARCHY_UPSTREAM_REPO:-carlosferrerdev/prumo}"
 PKGS_ORIGIN="${OMARCHY_PKGS_ORIGIN:-}"
 SITE_REPO="${OMARCHY_SITE_REPO:-}"
 ISO_REPO="${OMARCHY_ISO_REPO:-}"
+ISO_BRANCH="${OMARCHY_ISO_BRANCH:-quattro}"
+ISO_RCLONE_DEST="${OMARCHY_ISO_RCLONE_DEST:-}"
 DEV_BRANCH="${OMARCHY_DEV_BRANCH:-gnome}"
 
 PKGS_DB_BASE="${OMARCHY_PKGS_DB_BASE:-}"
@@ -46,6 +48,7 @@ require_release_config() {
   [[ -n "$PKGS_DB_BASE" ]] || missing+=(OMARCHY_PKGS_DB_BASE)
   [[ -n "$SITE_REPO" ]] || missing+=(OMARCHY_SITE_REPO)
   [[ -n "$ISO_REPO" ]] || missing+=(OMARCHY_ISO_REPO)
+  [[ -n "$ISO_RCLONE_DEST" ]] || missing+=(OMARCHY_ISO_RCLONE_DEST)
   if (( ${#missing[@]} > 0 )); then
     print_error "Gomarchy release infrastructure is not fully configured"
     print_error "Set: ${missing[*]}"
@@ -87,8 +90,10 @@ Commands:
 Options:
   --yes              Skip confirmation prompts (for scripting/CI)
   --host <host>      Build host ssh destination (else \$OMARCHY_REPO_HOST or .repo-host)
-  --iso / --no-iso   (rc, ship) Build the ISO without asking / skip it
-  --no-wait          (rc, ship) Do not poll for the published build
+  --iso / --no-iso   (rc, ship) Build the ISO without asking / explicitly waive it
+  --resume-site      (ship) Verify an already-published ISO, then update only the site
+  --no-wait          (rc, ship) Queue a needed build, then stop before promotion
+                     (incompatible with --iso)
   -h, --help         Show this help
 EOF
 }
@@ -127,14 +132,23 @@ previous_patch_tag() { # 4.0.2 -> v4.0.1
 
 ls_remote() { git ls-remote "$UPSTREAM_URL" "$@"; }
 
-tag_exists() { [[ -n "$(ls_remote "refs/tags/$1" | head -1)" ]]; }
+tag_exists() {
+  local target
+  target=$(resolve_tag_commit "$1") || return 2
+  [[ -n "$target" ]]
+}
 
-branch_head() { ls_remote "refs/heads/$1" | awk '{print $1}'; }
+branch_head() {
+  local branch="$1" refs
+  refs=$(ls_remote "refs/heads/$branch") || return 2
+  awk -v ref="refs/heads/$branch" '$2 == ref { print $1 }' <<<"$refs"
+}
 
 resolve_tag_commit() {
-  local tag="$1" peeled sha
-  peeled=$(ls_remote "refs/tags/$tag^{}" | awk '{print $1}')
-  sha=$(ls_remote "refs/tags/$tag" | awk '{print $1}')
+  local tag="$1" refs peeled sha
+  refs=$(ls_remote "refs/tags/$tag" "refs/tags/$tag^{}") || return $?
+  peeled=$(awk -v ref="refs/tags/$tag^{}" '$2 == ref { print $1 }' <<<"$refs")
+  sha=$(awk -v ref="refs/tags/$tag" '$2 == ref { print $1 }' <<<"$refs")
   echo "${peeled:-$sha}"
 }
 
@@ -143,22 +157,37 @@ resolve_tag_commit() {
 # needs to find a tagged train whose remaining steps (release, ISO, website)
 # didn't finish, so it can resume.
 newest_release_branch() { # newest_release_branch [--untagged]
-  local untagged_only=false
+  local untagged_only=false refs
   [[ "${1:-}" == "--untagged" ]] && untagged_only=true
   local branch best_ver="" best_branch="" ver
+  refs=$(ls_remote 'refs/heads/v*' 'refs/tags/v*') || return 2
   while IFS= read -r branch; do
     ver=$(branch_to_version "$branch") || continue
-    if [[ "$untagged_only" == true ]] && tag_exists "v$ver"; then
+    if [[ "$untagged_only" == true ]] &&
+      awk -v ref="refs/tags/v$ver" '$2 == ref { found = 1 } END { exit !found }' <<<"$refs"; then
       continue
     fi
     if [[ -z "$best_ver" ]] || [[ $(vercmp "$ver" "$best_ver") -gt 0 ]]; then
       best_ver="$ver" best_branch="$branch"
     fi
-  done < <(ls_remote 'refs/heads/v*' | awk -F/ '{print $3}')
+  done < <(awk '$2 ~ /^refs\/heads\/v/ { sub("refs/heads/", "", $2); print $2 }' <<<"$refs")
   [[ -n "$best_branch" ]] && echo "$best_branch"
 }
 
-open_train_branch() { newest_release_branch --untagged; }
+find_release_branch() { # find_release_branch [--untagged]; empty when none
+  local branch lookup_status=0
+  branch=$(newest_release_branch "$@") || lookup_status=$?
+  case "$lookup_status" in
+  0) echo "$branch" ;;
+  1) return 0 ;;
+  *)
+    print_error "Could not query release branches and tags on $UPSTREAM_REPO" >&2
+    return "$lookup_status"
+    ;;
+  esac
+}
+
+open_train_branch() { find_release_branch --untagged; }
 
 # Reads go over anonymous HTTPS; pushes go over SSH like every checkout the
 # operator owns. Pushing over HTTPS would drag in git's credential-helper
@@ -197,8 +226,33 @@ ensure_work_clone() {
 
 # --- published channel state -------------------------------------------------
 
-# Prints omarchy's published version in a channel; empty when absent, rc 2 when
-# the database cannot be read (callers must not mistake an outage for absence).
+# Prints the shared published version of the omarchy package pair. A missing or
+# divergent pair is invalid release evidence, not an older/empty channel.
+published_pair_from_descs() {
+  awk '
+    function emit() {
+      if ((name == "omarchy" || name == "omarchy-settings") && version != "") {
+        versions[name] = version
+      }
+      name = ""; version = ""
+    }
+    $0 == "%FILENAME%" { emit(); next }
+    $0 == "%NAME%"     { getline; name = $0; next }
+    $0 == "%VERSION%"  { getline; version = $0; next }
+    END {
+      emit()
+      if (versions["omarchy"] != "" &&
+          versions["omarchy"] == versions["omarchy-settings"]) {
+        print versions["omarchy"]
+      } else {
+        exit 3
+      }
+    }
+  '
+}
+
+# Returns 2 when the database cannot be read and 3 when the package pair is
+# missing or divergent. Callers must not mistake either state for absence.
 published_version() {
   local channel="$1" tmp descs
   tmp=$(mktemp) || return 2
@@ -214,29 +268,69 @@ published_version() {
     return 2
   fi
   rm -f "$tmp"
-  awk '
-    function emit() {
-      if (!found && name == "omarchy" && version != "") { print version; found = 1 }
-      name = ""; version = ""
-    }
-    $0 == "%FILENAME%" { emit(); next }
-    $0 == "%NAME%"    { getline; name = $0; next }
-    $0 == "%VERSION%" { getline; version = $0; next }
-    END { emit() }
-  ' <<<"$descs"
+  published_pair_from_descs <<<"$descs"
 }
 
 # The rc branch of THIS repo carries the current pins. Read them without
 # touching the working tree.
-rc_branch_pin() { # prints "pkgver commit", empty when no rc branch
-  local ref="origin/rc" pkgbuild
-  git -C "$BUILD_ROOT" fetch --quiet origin rc 2>/dev/null || true
-  pkgbuild=$(git -C "$BUILD_ROOT" show "$ref:pkgbuilds/omarchy/PKGBUILD" 2>/dev/null) || return 0
-  local pkgver commit
-  pkgver=$(grep -E '^pkgver=' <<<"$pkgbuild" | head -1 | cut -d= -f2)
-  commit=$(grep -E '^_commit=' <<<"$pkgbuild" | head -1 | cut -d= -f2 | tr -d "'\"")
-  [[ -n "$pkgver" ]] && echo "$pkgver $commit"
+release_pin_at_ref() { # release_pin_at_ref <git-ref> [repository]; prints "pkgver pkgrel commit"
+  local ref="$1" repo="${2:-$BUILD_ROOT}" runtime settings runtime_meta settings_meta
+  runtime=$(git -C "$repo" show "$ref:pkgbuilds/omarchy/PKGBUILD") || return $?
+  settings=$(git -C "$repo" show "$ref:pkgbuilds/omarchy-settings/PKGBUILD") || return $?
+
+  local field
+  for field in _tag _commit pkgver pkgrel; do
+    [[ $(grep -Ec "^${field}=" <<<"$runtime") -eq 1 ]] || return 1
+    [[ $(grep -Ec "^${field}=" <<<"$settings") -eq 1 ]] || return 1
+  done
+  [[ $(grep -Ec '^[[:space:]]*sha256sums=' <<<"$runtime") -eq 2 ]] || return 1
+  [[ $(grep -Ec '^[[:space:]]*sha256sums=' <<<"$settings") -eq 2 ]] || return 1
+  [[ $(grep -Ec '^[[:space:]]*sha256sums=\(\)[[:space:]]*$' <<<"$runtime") -eq 1 ]] || return 1
+  [[ $(grep -Ec '^[[:space:]]*sha256sums=\(\)[[:space:]]*$' <<<"$settings") -eq 1 ]] || return 1
+
+  runtime_meta=$(grep -E '^[[:space:]]*(_tag|_commit|pkgver|pkgrel|sha256sums)=' <<<"$runtime") || return 1
+  settings_meta=$(grep -E '^[[:space:]]*(_tag|_commit|pkgver|pkgrel|sha256sums)=' <<<"$settings") || return 1
+  [[ "$runtime_meta" == "$settings_meta" ]] || return 1
+
+  local runtime_ver runtime_commit runtime_tag runtime_rel runtime_sha
+  runtime_ver=$(grep -E '^pkgver=' <<<"$runtime" | head -1 | cut -d= -f2 | tr -d "'\"")
+  runtime_commit=$(grep -E '^_commit=' <<<"$runtime" | head -1 | cut -d= -f2 | tr -d "'\"")
+  runtime_tag=$(grep -E '^_tag=' <<<"$runtime" | head -1 | cut -d= -f2 | tr -d "'\"")
+  runtime_rel=$(grep -E '^pkgrel=' <<<"$runtime" | head -1 | cut -d= -f2 | tr -d "'\"")
+  runtime_sha=$(grep -E "^[[:space:]]*sha256sums=\('[0-9a-f]{64}'\)[[:space:]]*$" <<<"$runtime" | tail -1 | grep -oE '[0-9a-f]{64}') || return 1
+
+  [[ "$runtime_ver" =~ ^[0-9]+\.[0-9]+\.[0-9]+(rc[0-9]+)?$ ]] || return 1
+  [[ "$runtime_commit" =~ ^[0-9a-f]{40}$ ]] || return 1
+  [[ -z "$runtime_tag" || "$runtime_tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || return 1
+  [[ "$runtime_rel" =~ ^[1-9][0-9]*$ ]] || return 1
+  [[ "$runtime_sha" =~ ^[0-9a-f]{64}$ ]] || return 1
+  echo "$runtime_ver $runtime_rel $runtime_commit"
 }
+
+rc_branch_pin() { # prints "pkgver pkgrel commit", empty when no rc branch
+  local pin
+  git -C "$BUILD_ROOT" fetch --quiet --prune origin || return $?
+  git -C "$BUILD_ROOT" show-ref --verify --quiet refs/remotes/origin/rc || return 0
+  pin=$(release_pin_at_ref origin/rc) || return $?
+  release_pin_commit_has_exact_scope origin/rc || {
+    print_error "origin/rc tip changes files outside the release package pair" >&2
+    return 1
+  }
+  release_pin_branch_matches_master origin/rc || {
+    print_error "origin/rc is not master plus exactly one release pin commit" >&2
+    return 1
+  }
+  echo "$pin"
+}
+
+pin_version() { printf '%s\n' "${1%% *}"; }
+pin_pkgrel() {
+  local rest="${1#* }"
+  printf '%s\n' "${rest%% *}"
+}
+pin_source_commit() { printf '%s\n' "${1##* }"; }
+pin_package_version() { printf '%s-%s\n' "$(pin_version "$1")" "$(pin_pkgrel "$1")"; }
+published_version_matches_pin() { [[ "$1" == "$(pin_package_version "$2")" ]]; }
 
 # --- build host --------------------------------------------------------------
 #
@@ -278,13 +372,23 @@ trigger_rc_build() {
   local host
   if host=$(repo_host); then
     print_info "Building the RC on $host (this takes a while)..."
-    ssh "$host" "source /root/.omarchy/build-credentials 2>/dev/null; $RC_TRIGGER_SCRIPT"
+    ssh "$host" "set -e; source /root/.omarchy/build-credentials; $RC_TRIGGER_SCRIPT"
   elif on_repo_host; then
     print_info "Building the RC locally (this is the build host)..."
     bash -c "$RC_TRIGGER_SCRIPT"
   else
     print_no_host_help "build the release candidate" "$RC_TRIGGER_SCRIPT"
     return 1
+  fi
+}
+
+require_release_step() { # require_release_step <description> <command...>
+  local description="$1" status=0
+  shift
+  "$@" || status=$?
+  if ((status != 0)); then
+    print_error "$description failed (exit $status)"
+    return "$status"
   fi
 }
 
@@ -303,12 +407,12 @@ host_advance() { # host_advance <from> <to> [extra args...]
   "$BUILD_ROOT/bin/repo" advance --from "$from" --to "$to" --skip-prod-check "$@"
 }
 
-wait_for_published() { # wait_for_published <channel> <version> [timeout-seconds]
+wait_for_published() { # wait_for_published <channel> <pkgver-pkgrel> [timeout-seconds]
   local channel="$1" want="$2" timeout="${3:-3600}" waited=0 got
   print_info "Waiting for $want to appear in the $channel channel (up to $((timeout / 60))m)..."
   while ((waited < timeout)); do
     got=$(published_version "$channel" 2>/dev/null) || got=""
-    if [[ "${got%-*}" == "$want" ]]; then
+    if [[ "$got" == "$want" ]]; then
       print_success "$channel now serves omarchy $got"
       return 0
     fi
@@ -349,22 +453,127 @@ cut_pins() { # cut_pins <omarchy-pkgs release args...>
 
 # --- ISO ---------------------------------------------------------------------
 
+canonical_github_repo() {
+  local url="$1" repo
+  case "$url" in
+  https://github.com/*) repo=${url#https://github.com/} ;;
+  git@github.com:*) repo=${url#git@github.com:} ;;
+  *) return 1 ;;
+  esac
+  repo=${repo%.git}
+  [[ "$repo" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || return 1
+  printf '%s\n' "$repo"
+}
+
+validate_release_checkout() { # validate_release_checkout <directory> <repo> [read|write]
+  local dir="$1" expected_repo="$2" access="${3:-read}" actual commit push_url worktree_status
+  local push_urls=()
+  [[ "$expected_repo" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || {
+    print_error "Invalid configured GitHub repository: $expected_repo" >&2
+    return 1
+  }
+  git -C "$dir" rev-parse --is-inside-work-tree >/dev/null 2>&1 || {
+    print_error "Release checkout is not a git worktree: $dir" >&2
+    return 1
+  }
+  actual=$(git -C "$dir" remote get-url origin 2>/dev/null) || {
+    print_error "Release checkout has no readable origin: $dir" >&2
+    return 1
+  }
+  [[ $(canonical_github_repo "$actual") == "$expected_repo" ]] || {
+    print_error "Release checkout origin mismatch at $dir" >&2
+    print_error "Expected github.com/$expected_repo, found $actual" >&2
+    return 1
+  }
+  if [[ "$access" == write ]]; then
+    while IFS= read -r push_url; do
+      [[ -n "$push_url" ]] && push_urls+=("$push_url")
+    done < <(git -C "$dir" remote get-url --push --all origin 2>/dev/null || true)
+    if (( ${#push_urls[@]} != 1 )) ||
+      [[ $(canonical_github_repo "${push_urls[0]:-}") != "$expected_repo" ]]; then
+      print_error "Release checkout push origin mismatch at $dir" >&2
+      print_error "Expected exactly github.com/$expected_repo, found: ${push_urls[*]:-<none>}" >&2
+      return 1
+    fi
+  fi
+  worktree_status=$(git -C "$dir" status --porcelain) || {
+    print_error "Could not inspect release checkout state: $dir" >&2
+    return 1
+  }
+  [[ -z "$worktree_status" ]] || {
+    print_error "Release checkout is dirty: $dir" >&2
+    print_error "Commit, stash, or remove local changes before releasing" >&2
+    return 1
+  }
+  commit=$(git -C "$dir" rev-parse HEAD) || return 1
+  print_info "Using $expected_repo at ${commit:0:12}" >&2
+}
+
+fetch_iso_release_ref() { # fetch_iso_release_ref <directory>
+  local dir="$1"
+  git -C "$dir" fetch --quiet --prune origin \
+    "+refs/heads/$ISO_BRANCH:refs/remotes/origin/$ISO_BRANCH" || {
+    print_error "Could not fetch origin/$ISO_BRANCH at $dir" >&2
+    print_error "Refusing to release from stale ISO sources" >&2
+    return 1
+  }
+  git -C "$dir" show-ref --verify --quiet "refs/remotes/origin/$ISO_BRANCH" || {
+    print_error "ISO checkout has no origin/$ISO_BRANCH: $dir" >&2
+    return 1
+  }
+}
+
+require_iso_release_ref() { # require_iso_release_ref <directory>
+  local dir="$1" head remote_head
+  validate_release_checkout "$dir" "$ISO_REPO" || return 1
+  fetch_iso_release_ref "$dir" || return 1
+  head=$(git -C "$dir" rev-parse HEAD) || return 1
+  remote_head=$(git -C "$dir" rev-parse "origin/$ISO_BRANCH") || return 1
+  if [[ "$head" != "$remote_head" ]]; then
+    print_error "ISO checkout is not at origin/$ISO_BRANCH: $dir" >&2
+    print_error "Update it explicitly before releasing" >&2
+    return 1
+  fi
+}
+
+refresh_managed_iso_checkout() { # refresh_managed_iso_checkout <directory>
+  local dir="$1" head remote_head
+  validate_release_checkout "$dir" "$ISO_REPO" || return 1
+  fetch_iso_release_ref "$dir" || return 1
+  git -C "$dir" checkout --quiet --detach "origin/$ISO_BRANCH" || return $?
+  head=$(git -C "$dir" rev-parse HEAD) || return 1
+  remote_head=$(git -C "$dir" rev-parse "origin/$ISO_BRANCH") || return 1
+  [[ "$head" == "$remote_head" ]] || {
+    print_error "Managed ISO checkout did not reach origin/$ISO_BRANCH" >&2
+    return 1
+  }
+}
+
 iso_checkout() { # prints a usable omarchy-iso checkout, cloning to tmp if needed
-  if [[ -n "${OMARCHY_ISO_DIR:-}" && -d "${OMARCHY_ISO_DIR:-}" ]]; then
-    echo "$OMARCHY_ISO_DIR"
+  if [[ -n "${OMARCHY_ISO_DIR:-}" ]]; then
+    [[ -d "$OMARCHY_ISO_DIR" ]] || {
+      print_error "OMARCHY_ISO_DIR does not exist: $OMARCHY_ISO_DIR" >&2
+      return 1
+    }
+    local explicit_dir
+    explicit_dir=$(realpath "$OMARCHY_ISO_DIR")
+    require_iso_release_ref "$explicit_dir" || return 1
+    echo "$explicit_dir"
     return 0
   fi
-  if [[ -d "$BUILD_ROOT/../omarchy-iso/.git" ]]; then
-    realpath "$BUILD_ROOT/../omarchy-iso"
+  if git -C "$BUILD_ROOT/../omarchy-iso" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    local sibling
+    sibling=$(realpath "$BUILD_ROOT/../omarchy-iso")
+    require_iso_release_ref "$sibling" || return 1
+    echo "$sibling"
     return 0
   fi
   local tmp="$SRCDEST_DIR/omarchy-iso"
-  if [[ -d "$tmp" ]]; then
-    git -C "$tmp" pull --ff-only --quiet || true
-  else
+  if [[ ! -d "$tmp" ]]; then
     print_info "Cloning $ISO_REPO..." >&2
-    git clone --quiet "https://github.com/$ISO_REPO.git" "$tmp"
+    git clone --quiet --branch "$ISO_BRANCH" "https://github.com/$ISO_REPO.git" "$tmp" || return $?
   fi
+  refresh_managed_iso_checkout "$tmp" || return $?
   echo "$tmp"
 }
 
@@ -377,46 +586,160 @@ build_iso() { # build_iso <version> [--rc]
     return 1
   fi
   print_info "Building ${rc_flag:+RC }ISO $version (this takes a while)..."
-  (cd "$dir" && PATH="$dir/bin:$PATH" bin/omarchy-iso-release ${rc_flag:+"$rc_flag"} "$version")
+  (cd "$dir" && PATH="$dir/bin:$PATH" OMARCHY_ISO_RCLONE_DEST="$ISO_RCLONE_DEST" \
+    bin/omarchy-iso-release ${rc_flag:+"$rc_flag"} "$version")
 }
 
+verify_published_iso() { # verify_published_iso <version>
+  local version="$1" dir
+  dir=$(iso_checkout) || return 1
+  (cd "$dir" && OMARCHY_ISO_RCLONE_DEST="$ISO_RCLONE_DEST" \
+    bin/omarchy-iso-upload --verify-published "omarchy-$version.iso")
+}
+
+ISO_RELEASED=false
 maybe_iso() { # maybe_iso <version> <rc|final> <iso_mode: ask|yes|no>
-  local version="$1" kind="$2" mode="$3" rc_flag=""
+  local version="$1" kind="$2" mode="$3" rc_flag="" status=0
+  ISO_RELEASED=false
   [[ "$kind" == "rc" ]] && rc_flag="--rc"
   case "$mode" in
   no) return 0 ;;
-  yes) build_iso "$version" "$rc_flag" ;;
+  yes)
+    build_iso "$version" "$rc_flag" || status=$?
+    ;;
   ask)
     if confirm "Build and upload the ${kind} ISO for $version?"; then
-      build_iso "$version" "$rc_flag"
+      build_iso "$version" "$rc_flag" || status=$?
+    else
+      print_info "ISO not released; leaving the website unchanged"
+      print_info "Re-run with --iso to finish or --no-iso to explicitly waive it"
+      return 3
     fi
     ;;
+  *)
+    print_error "Invalid ISO release mode: $mode"
+    return 2
+    ;;
   esac
+  ((status == 0)) || return "$status"
+  ISO_RELEASED=true
+}
+
+maybe_rc_iso() { # maybe_rc_iso <version> <iso_mode> <publication-confirmed>
+  local version="$1" mode="$2" published="$3"
+  if [[ "$published" != true ]]; then
+    ISO_RELEASED=false
+    if [[ "$mode" == yes ]]; then
+      print_error "--no-wait cannot be combined with --iso for an unpublished RC"
+      print_error "Wait for the RC to publish, then re-run: omarchy-release rc --iso"
+      return 1
+    fi
+    if [[ "$mode" == ask ]]; then
+      print_info "Not offering an ISO yet: --no-wait left RC publication unverified"
+      print_info "After it publishes, re-run: omarchy-release rc --iso"
+    fi
+    return 0
+  fi
+  maybe_iso "$version" rc "$mode"
+}
+
+publish_ship_extras() { # publish_ship_extras <version> <iso_mode>
+  local version="$1" mode="$2"
+  if [[ "$mode" == resume ]]; then
+    require_release_step "Published ISO verification" verify_published_iso "$version" || return $?
+    ISO_RELEASED=true
+  else
+    require_release_step "Final ISO release" maybe_iso "$version" final "$mode" || return $?
+  fi
+  if [[ "$ISO_RELEASED" == true ]]; then
+    local site_status=0
+    require_release_step "Website ISO update" update_website "$version" || site_status=$?
+    if ((site_status != 0)); then
+      print_info "The ISO is published; retry the site without rebuilding it:"
+      print_info "  omarchy-release ship --resume-site"
+      return "$site_status"
+    fi
+  else
+    print_info "7/7 ISO not published; leaving the website untouched"
+  fi
+}
+
+website_remote_references_version() { # website_remote_references_version <version>
+  local version="$1" checkout refs ref result=1
+  [[ "$SITE_REPO" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || return 1
+  checkout=$(mktemp -d) || return 1
+  if git clone --quiet --depth 1 "https://github.com/$SITE_REPO.git" "$checkout/site"; then
+    refs=$(git -C "$checkout/site" grep -IohE \
+      'omarchy-[0-9]+\.[0-9]+\.[0-9]+(-rc)?\.iso' -- . 2>/dev/null) || refs=""
+    if [[ -n "$refs" ]]; then
+      result=0
+      while IFS= read -r ref; do
+        if [[ "$ref" != "omarchy-$version.iso" ]]; then
+          result=1
+          break
+        fi
+      done <<<"$refs"
+    fi
+  fi
+  rm -rf -- "$checkout"
+  return "$result"
 }
 
 # --- website -----------------------------------------------------------------
 
 update_website() { # update_website <version>
-  local version="$1" tmp="$SRCDEST_DIR/omarchy-site"
+  local version="$1" tmp="$SRCDEST_DIR/omarchy-site" default_ref target_branch
+  local matches search_status=0 relative f edit_tmp
   print_info "Updating $SITE_REPO ISO references to $version..."
   if [[ -d "$tmp" ]]; then
-    git -C "$tmp" fetch --quiet origin && git -C "$tmp" reset --quiet --hard origin/HEAD
+    validate_release_checkout "$tmp" "$SITE_REPO" write || return 1
+    if ! git -C "$tmp" fetch --quiet --prune origin; then
+      print_error "Could not refresh the cached website checkout at $tmp"
+      return 1
+    fi
   else
     git clone --quiet "git@github.com:$SITE_REPO.git" "$tmp" || {
       print_warning "Could not clone $SITE_REPO — update the ISO URL there manually"
       return 1
     }
   fi
-  local matches
-  matches=$(grep -rIlE 'omarchy-[0-9]+\.[0-9]+\.[0-9]+(-rc)?\.iso' "$tmp" --exclude-dir=.git || true)
+  validate_release_checkout "$tmp" "$SITE_REPO" write || return 1
+  git -C "$tmp" remote set-head origin --auto >/dev/null 2>&1 || {
+    print_error "Could not resolve the default branch for $SITE_REPO"
+    return 1
+  }
+  default_ref=$(git -C "$tmp" symbolic-ref --quiet refs/remotes/origin/HEAD) || {
+    print_error "The website checkout has no origin/HEAD"
+    return 1
+  }
+  target_branch=${default_ref#refs/remotes/origin/}
+  git -C "$tmp" checkout --quiet -B release-site-update "$default_ref" || return $?
+  matches=$(git -C "$tmp" grep -IlE 'omarchy-[0-9]+\.[0-9]+\.[0-9]+(-rc)?\.iso' -- .) || search_status=$?
+  if ((search_status > 1)); then
+    print_error "Could not search tracked website files for ISO references"
+    return "$search_status"
+  fi
   if [[ -z "$matches" ]]; then
     print_warning "No omarchy-<version>.iso references found in $SITE_REPO — update it manually"
     return 1
   fi
-  echo "$matches" | while IFS= read -r f; do
-    sed -i -E "s/omarchy-[0-9]+\.[0-9]+\.[0-9]+\.iso/omarchy-$version.iso/g" "$f"
-    echo "  updated: ${f#"$tmp"/}"
-  done
+  while IFS= read -r relative; do
+    [[ -n "$relative" ]] || continue
+    f="$tmp/$relative"
+    if [[ ! -f "$f" || -L "$f" ]]; then
+      print_error "Refusing unsafe tracked website file: $relative"
+      return 1
+    fi
+    edit_tmp=$(mktemp "$SRCDEST_DIR/.omarchy-site-edit.XXXXXX") || return 1
+    if ! sed -E "s/omarchy-[0-9]+\.[0-9]+\.[0-9]+(-rc)?\.iso/omarchy-$version.iso/g" "$f" >"$edit_tmp" ||
+       ! cat "$edit_tmp" >"$f"; then
+      rm -f -- "$edit_tmp"
+      print_error "Could not update tracked website file: $relative"
+      return 1
+    fi
+    rm -f -- "$edit_tmp" || return 1
+    echo "  updated: $relative"
+  done <<<"$matches"
   if git -C "$tmp" diff --quiet; then
     print_info "Website already references $version"
     return 0
@@ -426,9 +749,183 @@ update_website() { # update_website <version>
     print_info "Left uncommitted in $tmp"
     return 1
   }
-  git -C "$tmp" commit --quiet -am "Point ISO download at omarchy-$version.iso" &&
-    git -C "$tmp" push --quiet origin HEAD
+  if ! git -C "$tmp" commit --quiet -am "Point ISO download at omarchy-$version.iso" ||
+     ! git -C "$tmp" push --quiet origin "HEAD:$target_branch"; then
+    print_error "Could not publish the website ISO update"
+    return 1
+  fi
   print_success "Website updated to omarchy-$version.iso"
+}
+
+sync_final_pins_to_master() { # sync_final_pins_to_master <pin-sha>
+  local pin_sha="$1" sync_wt="$BUILD_ROOT/.worktrees/master-sync" status=0
+  git -C "$BUILD_ROOT" fetch --quiet origin || return $?
+  if [[ ! -d "$sync_wt" ]]; then
+    git -C "$BUILD_ROOT" worktree add --quiet -B release-master-sync "$sync_wt" origin/master || return $?
+  else
+    git -C "$sync_wt" checkout --quiet -B release-master-sync origin/master || return $?
+  fi
+
+  (cd "$sync_wt" && git cherry-pick "$pin_sha" && git push --quiet origin HEAD:master) || status=$?
+  if ((status != 0)); then
+    (cd "$sync_wt" && git cherry-pick --abort 2>/dev/null || true)
+    return "$status"
+  fi
+}
+
+release_pin_files_match() { # release_pin_files_match <left-ref> <right-ref> [repository]
+  local repo="${3:-$BUILD_ROOT}"
+  git -C "$repo" diff --quiet "$1" "$2" -- \
+    pkgbuilds/omarchy/PKGBUILD \
+    pkgbuilds/omarchy-settings/PKGBUILD
+}
+
+normalize_pkgbuild_release_fields() {
+  sed -E \
+    -e "s/^_tag=.*/_tag='<release>'/" \
+    -e "s/^_commit=.*/_commit='<release>'/" \
+    -e 's/^pkgver=.*/pkgver=<release>/' \
+    -e 's/^pkgrel=.*/pkgrel=<release>/' \
+    -e "s/^([[:space:]]*)sha256sums=\('[0-9a-f]{64}'\)[[:space:]]*$/\1sha256sums=('<release>')/"
+}
+
+release_pin_commit_has_exact_scope() { # release_pin_commit_has_exact_scope <ref> [repository]
+  local ref="$1" repo="${2:-$BUILD_ROOT}" changed expected parent pkg before after
+  changed=$(git -C "$repo" diff-tree --no-commit-id --name-only -r "$ref" | LC_ALL=C sort) || return $?
+  expected=$'pkgbuilds/omarchy-settings/PKGBUILD\npkgbuilds/omarchy/PKGBUILD'
+  [[ "$changed" == "$expected" ]] || return 1
+  parent=$(git -C "$repo" rev-parse "$ref^") || return 1
+  for pkg in omarchy omarchy-settings; do
+    before=$(git -C "$repo" show "$parent:pkgbuilds/$pkg/PKGBUILD") || return 1
+    after=$(git -C "$repo" show "$ref:pkgbuilds/$pkg/PKGBUILD") || return 1
+    before=$(normalize_pkgbuild_release_fields <<<"$before") || return 1
+    after=$(normalize_pkgbuild_release_fields <<<"$after") || return 1
+    [[ "$before" == "$after" ]] || return 1
+  done
+}
+
+release_pin_branch_matches_master() { # release_pin_branch_matches_master <pin-ref> [repository] [master-ref]
+  local ref="$1" repo="${2:-$BUILD_ROOT}" master_ref="${3:-origin/master}" parent status=0
+  parent=$(git -C "$repo" rev-parse "$ref^") || return 1
+  git -C "$repo" diff --quiet "$parent" "$master_ref" -- || status=$?
+  case "$status" in
+  0) return 0 ;;
+  1) ;;
+  *) return "$status" ;;
+  esac
+  git -C "$repo" merge-base --is-ancestor "$parent" "$master_ref" || return $?
+  release_pin_files_match "$ref" "$master_ref" "$repo"
+}
+
+validate_release_modes() { # validate_release_modes <command> <iso-mode> <wait>
+  local command="$1" iso_mode="$2" wait="$3"
+  if [[ "$iso_mode" == resume ]]; then
+    if [[ "$command" != ship || "$wait" != true ]]; then
+      print_error "--resume-site is only valid with ship and cannot use --no-wait"
+      return 2
+    fi
+    return 0
+  fi
+  case "$command" in
+  "" | rc | ship)
+    if [[ "$wait" != true && "$iso_mode" == yes ]]; then
+      print_error "--no-wait cannot be combined with --iso"
+      print_error "Wait for the exact package build before releasing an ISO"
+      return 2
+    fi
+    ;;
+  *)
+    if [[ "$iso_mode" != ask || "$wait" != true ]]; then
+      print_error "ISO and wait options are only valid with rc, ship, or guided mode"
+      return 2
+    fi
+    ;;
+  esac
+}
+
+validate_command_args() { # validate_command_args <command> <arg-count>
+  local command="$1" arg_count="$2"
+  case "$command" in
+  start)
+    ((arg_count <= 1)) || {
+      print_error "start accepts at most one version"
+      return 2
+    }
+    ;;
+  pick) ;;
+  "" | rc | ship | status | doctor | self-test)
+    ((arg_count == 0)) || {
+      print_error "${command:-guided mode} does not accept positional arguments"
+      return 2
+    }
+    ;;
+  esac
+}
+
+require_tag_target() { # require_tag_target <tag> <expected-commit>
+  local tag="$1" expected="$2" actual
+  actual=$(resolve_tag_commit "$tag") || return $?
+  if [[ -z "$actual" || "$actual" != "$expected" ]]; then
+    print_error "Tag $tag resolves to '${actual:-nothing}', expected $expected"
+    return 1
+  fi
+}
+
+github_release_is_final() { # github_release_is_final <version>
+  local state
+  state=$(gh release view "v$1" --repo "$UPSTREAM_REPO" \
+    --json isDraft,isPrerelease --jq '.isDraft == false and .isPrerelease == false') || return $?
+  [[ "$state" == true ]]
+}
+
+cmd_resume_site() { # cmd_resume_site <version> <pin-version> <pkgrel> <pin-commit> <tag-commit>
+  local version="$1" pin_ver="$2" pin_rel="$3" pin_commit="$4" tag_commit="$5"
+  local expected_pin="$version $pin_rel $pin_commit" expected_package="$version-$pin_rel"
+  local rc_pub stable_pub pin_sha rc_pin master_pin
+  print_header "Resume website publication for $version"
+
+  [[ "$pin_ver" == "$version" ]] || {
+    print_error "Final $version pins are not present in rc"
+    return 1
+  }
+  if ! rc_pub=$(published_version rc 2>/dev/null) || [[ "$rc_pub" != "$expected_package" ]]; then
+    print_error "The exact $version package pair is not verifiably published in rc"
+    return 1
+  fi
+  if ! stable_pub=$(published_version stable 2>/dev/null) || [[ "$stable_pub" != "$expected_package" ]]; then
+    print_error "The exact $version package pair is not verifiably published in stable"
+    return 1
+  fi
+  [[ -n "$tag_commit" && "$tag_commit" == "$pin_commit" ]] || {
+    print_error "Tag v$version is absent or does not target $pin_commit"
+    return 1
+  }
+
+  git -C "$BUILD_ROOT" fetch --quiet origin master rc || return $?
+  pin_sha=$(git -C "$BUILD_ROOT" rev-parse origin/rc) || return 1
+  release_pin_commit_has_exact_scope "$pin_sha" || {
+    print_error "origin/rc pin commit has an unsafe scope"
+    return 1
+  }
+  release_pin_branch_matches_master "$pin_sha" || {
+    print_error "origin/rc is not based on the verified master release tree"
+    return 1
+  }
+  rc_pin=$(release_pin_at_ref "$pin_sha") || rc_pin=""
+  master_pin=$(release_pin_at_ref origin/master) || master_pin=""
+  if [[ "$rc_pin" != "$expected_pin" || "$master_pin" != "$expected_pin" ]] ||
+    ! release_pin_files_match origin/master "$pin_sha"; then
+    print_error "rc/master do not carry the exact final $version pin files"
+    return 1
+  fi
+  github_release_is_final "$version" || {
+    print_error "GitHub release v$version is absent, draft, or prerelease"
+    return 1
+  }
+
+  print_success "Package, tag, master, and GitHub release state verified"
+  publish_ship_extras "$version" resume || return $?
+  print_success "Website publication completed for $version without rebuilding the ISO"
 }
 
 # --- commands ----------------------------------------------------------------
@@ -444,13 +941,17 @@ cmd_start() {
     print_error "Invalid version '$version' (expected X.Y.Z)"
     exit 1
   fi
-  local branch
+  local branch tag_status=0 existing_head
   branch=$(version_to_branch "$version")
 
   print_header "Open release train $version"
 
-  if tag_exists "v$version"; then
+  tag_exists "v$version" || tag_status=$?
+  if ((tag_status == 0)); then
     print_error "v$version is already tagged on $UPSTREAM_REPO — this train has shipped"
+    exit 1
+  elif ((tag_status > 1)); then
+    print_error "Could not verify whether v$version already exists"
     exit 1
   fi
 
@@ -459,18 +960,37 @@ cmd_start() {
   if version_is_patch "$version"; then
     kind="patch"
     base_ref=$(previous_patch_tag "$version")
-    if ! tag_exists "$base_ref"; then
+    tag_status=0
+    tag_exists "$base_ref" || tag_status=$?
+    if ((tag_status == 1)); then
       print_error "Base tag $base_ref not found on $UPSTREAM_REPO"
       exit 1
+    elif ((tag_status > 1)); then
+      print_error "Could not verify base tag $base_ref"
+      exit 1
     fi
-    base_sha=$(resolve_tag_commit "$base_ref")
+    base_sha=$(resolve_tag_commit "$base_ref") || {
+      print_error "Could not resolve base tag $base_ref"
+      exit 1
+    }
   else
     kind="minor/major"
     base_ref="$DEV_BRANCH"
-    base_sha=$(branch_head "$DEV_BRANCH")
+    base_sha=$(branch_head "$DEV_BRANCH") || {
+      print_error "Could not query $DEV_BRANCH on $UPSTREAM_REPO"
+      exit 1
+    }
+    [[ -n "$base_sha" ]] || {
+      print_error "Development branch $DEV_BRANCH does not exist on $UPSTREAM_REPO"
+      exit 1
+    }
   fi
 
-  if [[ -n "$(branch_head "$branch")" ]]; then
+  existing_head=$(branch_head "$branch") || {
+    print_error "Could not query release branch $branch"
+    exit 1
+  }
+  if [[ -n "$existing_head" ]]; then
     print_success "Release branch $branch already exists — adopting it"
   else
     print_info "Release type: $kind — branching $branch from $base_ref (${base_sha:0:12})"
@@ -514,7 +1034,7 @@ cmd_start() {
 cmd_pick() {
   require_release_config
   local branch version
-  branch=$(open_train_branch) || true
+  branch=$(open_train_branch) || exit $?
   if [[ -z "$branch" ]]; then
     print_error "No open release train — run: omarchy-release start"
     exit 1
@@ -665,7 +1185,7 @@ cmd_rc() {
   require_release_config
   local iso_mode="$1" wait="$2"
   local branch version
-  branch=$(open_train_branch) || true
+  branch=$(open_train_branch) || exit $?
   if [[ -z "$branch" ]]; then
     print_error "No open release train — run: omarchy-release start"
     exit 1
@@ -674,27 +1194,44 @@ cmd_rc() {
   print_header "Cut RC for train $version"
 
   local head
-  head=$(branch_head "$branch")
+  head=$(branch_head "$branch") || {
+    print_error "Could not resolve $branch before cutting an RC"
+    exit 1
+  }
+  [[ -n "$head" ]] || {
+    print_error "Release branch $branch disappeared before the RC cut"
+    exit 1
+  }
   print_info "Branch $branch head: ${head:0:12}"
 
   # Idempotence: if the current rc pin already matches the branch head and is
   # published, there is nothing to cut.
   local pin
-  pin=$(rc_branch_pin)
+  pin=$(rc_branch_pin) || return $?
   if [[ -n "$pin" ]]; then
-    local pin_ver="${pin%% *}" pin_commit="${pin##* }"
+    local pin_ver pin_rel pin_commit
+    pin_ver=$(pin_version "$pin")
+    pin_rel=$(pin_pkgrel "$pin")
+    pin_commit=$(pin_source_commit "$pin")
     if [[ "$pin_commit" == "$head" && "$pin_ver" =~ ^${version//./\\.}rc[0-9]+$ ]]; then
       local pub
-      pub=$(published_version rc 2>/dev/null) || pub=""
-      if [[ "${pub%-*}" == "$pin_ver" ]]; then
+      if ! pub=$(published_version rc 2>/dev/null); then
+        print_error "Cannot verify the published omarchy package pair in rc"
+        return 1
+      fi
+      if published_version_matches_pin "$pub" "$pin"; then
         print_success "$pin_ver is already cut from this head and published to rc"
-        maybe_iso "$version" rc "$iso_mode"
+        maybe_rc_iso "$version" "$iso_mode" true
         return 0
       fi
       print_info "$pin_ver is pinned from this head but not published yet — re-triggering the build"
-      trigger_rc_build || true
-      [[ "$wait" == true ]] && wait_for_published rc "$pin_ver"
-      maybe_iso "$version" rc "$iso_mode"
+      require_release_step "RC build trigger" trigger_rc_build || return $?
+      local publication_confirmed=false
+      if [[ "$wait" == true ]]; then
+        wait_for_published rc "$pin_ver-$pin_rel" || return $?
+        publication_confirmed=true
+      fi
+      maybe_rc_iso "$version" "$iso_mode" "$publication_confirmed" || return $?
       return 0
     fi
   fi
@@ -703,16 +1240,24 @@ cmd_rc() {
 
   cut_pins rc --base "$version" --ref "$branch"
 
-  local new_pin new_ver
-  new_pin=$(rc_branch_pin)
-  new_ver="${new_pin%% *}"
+  local new_pin new_ver new_rel new_commit
+  new_pin=$(rc_branch_pin) || return $?
+  new_ver=$(pin_version "$new_pin")
+  new_rel=$(pin_pkgrel "$new_pin")
+  new_commit=$(pin_source_commit "$new_pin")
+  if [[ ! "$new_ver" =~ ^${version//./\\.}rc[0-9]+$ || "$new_commit" != "$head" ]]; then
+    print_error "RC pin verification failed: found '${new_pin:-nothing}', expected ${version}rcN $head"
+    return 1
+  fi
   print_success "Pinned $new_ver (rc branch pushed)"
 
-  trigger_rc_build || true
+  require_release_step "RC build trigger" trigger_rc_build || return $?
+  local publication_confirmed=false
   if [[ "$wait" == true ]]; then
-    wait_for_published rc "$new_ver" || return 1
+    wait_for_published rc "$new_ver-$new_rel" || return 1
+    publication_confirmed=true
   fi
-  maybe_iso "$version" rc "$iso_mode"
+  maybe_rc_iso "$version" "$iso_mode" "$publication_confirmed" || return $?
   echo ""
   print_info "Test the candidate, then: omarchy-release ship  (or pick + rc again)"
 }
@@ -721,34 +1266,31 @@ cmd_ship() {
   require_release_config
   local iso_mode="$1" wait="$2"
   local branch version
-  branch=$(open_train_branch) || true
+  branch=$(open_train_branch) || exit $?
   if [[ -z "$branch" ]]; then
     # A tagged train whose later steps (release, ISO, website) failed is
     # invisible to open_train_branch — find it so a re-run can resume.
-    branch=$(newest_release_branch) || true
+    branch=$(find_release_branch) || exit $?
     if [[ -z "$branch" ]]; then
       print_error "No release train found — nothing to ship"
       exit 1
     fi
     version=$(branch_to_version "$branch")
-    local stable_now
-    stable_now=$(published_version stable 2>/dev/null) || stable_now=""
-    if [[ "${stable_now%-*}" == "$version" ]] &&
-      gh release view "v$version" --repo "$UPSTREAM_REPO" >/dev/null 2>&1; then
-      print_success "Nothing to ship — $version is tagged, released, and live on stable"
-      exit 0
-    fi
     print_info "Resuming tagged-but-incomplete train $version"
   else
     version=$(branch_to_version "$branch")
   fi
   print_header "Ship $version"
 
-  local head pin pin_ver pin_commit
-  head=$(branch_head "$branch")
-  pin=$(rc_branch_pin)
-  pin_ver="${pin%% *}"
-  pin_commit="${pin##* }"
+  local head pin pin_ver pin_rel pin_commit tag_commit tag_preexists=false
+  head=$(branch_head "$branch") || {
+    print_error "Could not resolve release branch $branch"
+    exit 1
+  }
+  pin=$(rc_branch_pin) || exit $?
+  pin_ver=$(pin_version "$pin")
+  pin_rel=$(pin_pkgrel "$pin")
+  pin_commit=$(pin_source_commit "$pin")
 
   # The ship guard: only the exact commit an RC was cut from may ship. There
   # is no override — a moved branch means an untested tree; cut another rc.
@@ -776,12 +1318,31 @@ cmd_ship() {
       exit 1
     fi
     local pub
-    pub=$(published_version rc 2>/dev/null) || pub=""
-    if [[ "${pub%-*}" != "$pin_ver" ]]; then
+    if ! pub=$(published_version rc 2>/dev/null); then
+      print_error "Cannot verify the published omarchy package pair in rc"
+      exit 1
+    fi
+    if ! published_version_matches_pin "$pub" "$pin"; then
       print_error "$pin_ver is pinned but rc serves '${pub:-nothing}' — the candidate build hasn't published"
       echo "Wait for it (or re-run: omarchy-release rc), then ship."
       exit 1
     fi
+  fi
+
+  # A colliding tag is irreversible release state. Resolve and validate it
+  # before pinning or promoting anything, not when the train reaches step 3.
+  if ! tag_commit=$(resolve_tag_commit "v$version"); then
+    print_error "Cannot query tag v$version before shipping"
+    exit 1
+  fi
+  if [[ -n "$tag_commit" ]]; then
+    require_release_step "Existing tag preflight" require_tag_target "v$version" "$pin_commit" || exit $?
+    tag_preexists=true
+  fi
+
+  if [[ "$iso_mode" == resume ]]; then
+    cmd_resume_site "$version" "$pin_ver" "$pin_rel" "$pin_commit" "$tag_commit" || exit $?
+    return 0
   fi
 
   echo ""
@@ -797,29 +1358,54 @@ cmd_ship() {
   confirm "Ship $version?" || exit 1
 
   # 1. Final pins into rc
-  local rc_pub stable_pub
-  rc_pub=$(published_version rc 2>/dev/null) || rc_pub=""
-  if [[ "${rc_pub%-*}" == "$version" ]]; then
+  local rc_pub stable_pub expected_package="$version-$pin_rel"
+  if ! rc_pub=$(published_version rc 2>/dev/null); then
+    print_error "1/7 Cannot verify the published omarchy package pair in rc"
+    exit 1
+  fi
+  if [[ "$pin_ver" == "$version" && "$rc_pub" == "$expected_package" ]]; then
     print_success "1/7 Final $version already published to rc"
   else
     if [[ "$pin_ver" != "$version" ]]; then
       print_info "1/7 Pinning final $version..."
       cut_pins "v$version" --commit "$pin_commit"
+      pin=$(rc_branch_pin) || exit 1
+      pin_ver=$(pin_version "$pin")
+      pin_rel=$(pin_pkgrel "$pin")
+      local verified_pin_commit
+      verified_pin_commit=$(pin_source_commit "$pin")
+      if [[ "$pin_ver" != "$version" || "$verified_pin_commit" != "$pin_commit" ]]; then
+        print_error "1/7 Final pin verification failed: found '${pin:-nothing}'"
+        exit 1
+      fi
+      expected_package="$pin_ver-$pin_rel"
     else
       print_info "1/7 Final $version pinned — re-triggering build"
     fi
-    trigger_rc_build || true
-    wait_for_published rc "$version" || exit 1
+    require_release_step "Final package build trigger" trigger_rc_build || exit $?
+    if [[ "$wait" != true ]]; then
+      print_success "Final $version build queued"
+      print_info "Publication is not verified; no promotion or release step was attempted"
+      print_info "Re-run: omarchy-release ship"
+      return 0
+    fi
+    wait_for_published rc "$expected_package" || exit 1
   fi
 
   # 2. Promote rc -> stable
-  stable_pub=$(published_version stable 2>/dev/null) || stable_pub=""
-  if [[ "${stable_pub%-*}" == "$version" ]]; then
+  if ! stable_pub=$(published_version stable 2>/dev/null); then
+    print_error "2/7 Cannot verify the published omarchy package pair in stable"
+    exit 1
+  fi
+  if [[ "$stable_pub" == "$expected_package" ]]; then
     print_success "2/7 Stable already serves $version"
   else
     host_advance rc stable || exit 1
-    stable_pub=$(published_version stable 2>/dev/null) || stable_pub=""
-    if [[ "${stable_pub%-*}" != "$version" ]]; then
+    if ! stable_pub=$(published_version stable 2>/dev/null); then
+      print_error "2/7 Promotion completed, but the stable package pair cannot be verified"
+      exit 1
+    fi
+    if [[ "$stable_pub" != "$expected_package" ]]; then
       print_error "Promotion ran but stable serves '${stable_pub:-nothing}' — investigate before continuing"
       exit 1
     fi
@@ -828,7 +1414,7 @@ cmd_ship() {
 
   # 3. Tag — at the pinned commit the artifacts were built from, never the
   # branch head (they can differ on a resumed ship).
-  if tag_exists "v$version"; then
+  if [[ "$tag_preexists" == true ]]; then
     print_success "3/7 Tag v$version already exists"
   else
     ensure_mirror_clone
@@ -837,31 +1423,50 @@ cmd_ship() {
   fi
 
   # 4. Final pins onto master (keeps edge overlap publishing and the repo record)
-  local master_ver
-  master_ver=$(git -C "$BUILD_ROOT" show origin/master:pkgbuilds/omarchy/PKGBUILD 2>/dev/null | grep -E '^pkgver=' | head -1 | cut -d= -f2)
-  if [[ "$master_ver" == "$version" ]]; then
-    print_success "4/7 master already carries the $version pins"
+  git -C "$BUILD_ROOT" fetch --quiet origin master rc || {
+    print_error "4/7 Could not refresh origin/master and origin/rc"
+    exit 1
+  }
+  local expected_pin="$version $pin_rel $pin_commit" master_pin pin_sha rc_pin
+  pin_sha=$(git -C "$BUILD_ROOT" rev-parse origin/rc) || exit 1
+  release_pin_commit_has_exact_scope "$pin_sha" || {
+    print_error "4/7 origin/rc pin commit changes files outside the release pair"
+    exit 1
+  }
+  release_pin_branch_matches_master "$pin_sha" || {
+    print_error "4/7 origin/rc is not master plus the release pin"
+    exit 1
+  }
+  rc_pin=$(release_pin_at_ref "$pin_sha") || {
+    print_error "4/7 The final origin/rc pin commit is malformed"
+    exit 1
+  }
+  [[ "$rc_pin" == "$expected_pin" ]] || {
+    print_error "4/7 origin/rc carries '$rc_pin', expected '$expected_pin'"
+    exit 1
+  }
+  master_pin=$(release_pin_at_ref origin/master 2>/dev/null) || master_pin=""
+  if [[ "$master_pin" == "$expected_pin" ]] && release_pin_files_match origin/master "$pin_sha"; then
+    print_success "4/7 master already carries the exact $version pins"
   else
-    local pin_sha
-    pin_sha=$(git -C "$BUILD_ROOT" rev-parse origin/rc 2>/dev/null || true)
     print_info "4/7 Bringing the final pin commit to master..."
-    local sync_wt="$BUILD_ROOT/.worktrees/master-sync"
-    git -C "$BUILD_ROOT" fetch --quiet origin
-    if [[ ! -d "$sync_wt" ]]; then
-      git -C "$BUILD_ROOT" worktree add --quiet -B release-master-sync "$sync_wt" origin/master
-    else
-      git -C "$sync_wt" checkout --quiet -B release-master-sync origin/master
+    require_release_step "Final pin synchronization to master" sync_final_pins_to_master "$pin_sha" || exit $?
+    git -C "$BUILD_ROOT" fetch --quiet origin master || exit 1
+    master_pin=$(release_pin_at_ref origin/master) || master_pin=""
+    if [[ "$master_pin" != "$expected_pin" ]] || ! release_pin_files_match origin/master "$pin_sha"; then
+      print_error "4/7 master verification failed: found '${master_pin:-invalid}', expected '$expected_pin'"
+      exit 1
     fi
-    if (cd "$sync_wt" && git cherry-pick "$pin_sha" && git push --quiet origin HEAD:master); then
-      print_success "4/7 Final pins merged to master"
-    else
-      (cd "$sync_wt" && git cherry-pick --abort 2>/dev/null || true)
-      print_warning "4/7 Could not fast-path the pins to master — cherry-pick $pin_sha onto master manually"
-    fi
+    print_success "4/7 Final pins merged to master"
   fi
 
   # 5. GitHub release from the staging PR body
   if gh release view "v$version" --repo "$UPSTREAM_REPO" >/dev/null 2>&1; then
+    github_release_is_final "$version" || {
+      print_error "5/7 GitHub release v$version exists but is draft or prerelease"
+      print_error "Publish it as a final release, then re-run ship"
+      exit 1
+    }
     print_success "5/7 GitHub release v$version already exists"
   else
     local notes
@@ -870,19 +1475,13 @@ cmd_ship() {
       notes="Omarchy $version"
       print_warning "No staging PR body found — using a bare title; edit the release afterwards"
     fi
-    gh release create "v$version" --repo "$UPSTREAM_REPO" --title "v$version" --notes "$notes"
+    gh release create "v$version" --repo "$UPSTREAM_REPO" --verify-tag \
+      --title "v$version" --notes "$notes"
     print_success "5/7 GitHub release v$version created"
   fi
 
-  # 6. ISO
-  maybe_iso "$version" final "$iso_mode" || true
-
-  # 7. Website (only meaningful once the final ISO exists)
-  if [[ "$iso_mode" != "no" ]]; then
-    update_website "$version" || true
-  else
-    print_info "7/7 --no-iso: leaving the website untouched"
-  fi
+  # 6–7. The website is a consumer of a successfully published ISO.
+  publish_ship_extras "$version" "$iso_mode" || exit $?
 
   echo ""
   print_success "Shipped $version — rc and stable are in parity for the next patch train"
@@ -895,14 +1494,18 @@ gather_status() {
   EDGE_VER=$(published_version edge 2>/dev/null) || EDGE_VER="<unreachable>"
   RC_VER=$(published_version rc 2>/dev/null) || RC_VER="<unreachable>"
   STABLE_VER=$(published_version stable 2>/dev/null) || STABLE_VER="<unreachable>"
-  TRAIN=$(open_train_branch 2>/dev/null) || TRAIN=""
+  TRAIN=$(open_train_branch) || return $?
   TRAIN_VER=""
   TRAIN_HEAD=""
   PIN=""
   if [[ -n "$TRAIN" ]]; then
     TRAIN_VER=$(branch_to_version "$TRAIN")
-    TRAIN_HEAD=$(branch_head "$TRAIN")
-    PIN=$(rc_branch_pin)
+    TRAIN_HEAD=$(branch_head "$TRAIN") || return $?
+    [[ -n "$TRAIN_HEAD" ]] || {
+      print_error "Open release branch $TRAIN disappeared while gathering status"
+      return 1
+    }
+    PIN=$(rc_branch_pin) || return $?
   fi
 }
 
@@ -910,26 +1513,33 @@ next_step() { # prints "<command>|<description>"
   if [[ -z "$TRAIN" ]]; then
     # A tagged train may still have unfinished ship steps (release/ISO/site).
     local last last_ver
-    last=$(newest_release_branch 2>/dev/null) || last=""
+    last=$(find_release_branch) || return $?
     if [[ -n "$last" && "$STABLE_VER" != "<unreachable>" ]]; then
       last_ver=$(branch_to_version "$last")
       if [[ "${STABLE_VER%-*}" != "$last_ver" ]] ||
-        { command -v gh >/dev/null && ! gh release view "v$last_ver" --repo "$UPSTREAM_REPO" >/dev/null 2>&1; }; then
+        { command -v gh >/dev/null && ! github_release_is_final "$last_ver" >/dev/null 2>&1; }; then
         echo "ship|$last_ver is tagged but not fully shipped — resume ship"
+        return
+      fi
+      if ! website_remote_references_version "$last_ver" >/dev/null 2>&1; then
+        echo "resume-site|$last_ver packages/release are live but the website is incomplete — verify the published ISO and resume only the site"
         return
       fi
     fi
     echo "start|No open train — start the next release"
     return
   fi
-  local pin_ver="${PIN%% *}" pin_commit="${PIN##* }"
+  local pin_ver pin_rel pin_commit
+  pin_ver=$(pin_version "$PIN")
+  pin_rel=$(pin_pkgrel "$PIN")
+  pin_commit=$(pin_source_commit "$PIN")
   if [[ -z "$PIN" || ! "$pin_ver" =~ ^${TRAIN_VER//./\\.}(rc[0-9]+)?$ ]]; then
     echo "rc|Cut the first candidate for $TRAIN_VER"
   elif [[ "$pin_ver" == "$TRAIN_VER" ]]; then
     echo "ship|Final $TRAIN_VER is pinned — finish shipping (re-runs are safe)"
   elif [[ "$pin_commit" != "$TRAIN_HEAD" ]]; then
     echo "rc|$TRAIN has commits newer than $pin_ver — cut the next candidate"
-  elif [[ "${RC_VER%-*}" != "$pin_ver" ]]; then
+  elif ! published_version_matches_pin "$RC_VER" "$PIN"; then
     echo "rc|$pin_ver is pinned but not published — re-run rc to re-trigger/wait"
   else
     echo "ship|$pin_ver is published to rc — test it, then ship"
@@ -948,7 +1558,7 @@ print_status() {
   else
     echo "  Open train: $TRAIN_VER (branch $TRAIN @ ${TRAIN_HEAD:0:12})"
     if [[ -n "$PIN" ]]; then
-      echo "  Current pin: ${PIN%% *} from commit ${PIN##* }"
+      echo "  Current pin: $(pin_package_version "$PIN") from commit $(pin_source_commit "$PIN")"
     else
       echo "  Current pin: <none>"
     fi
@@ -956,7 +1566,9 @@ print_status() {
   echo ""
   local step
   step=$(next_step)
-  echo "  Next: omarchy-release ${step%%|*}  — ${step#*|}"
+  local display_command="${step%%|*}"
+  [[ "$display_command" == resume-site ]] && display_command="ship --resume-site"
+  echo "  Next: omarchy-release $display_command  — ${step#*|}"
 }
 
 cmd_shepherd() {
@@ -972,6 +1584,7 @@ cmd_shepherd() {
     pick) cmd_pick ;;
     rc) cmd_rc "$ISO_MODE" "$WAIT" ;;
     ship) cmd_ship "$ISO_MODE" "$WAIT" ;;
+    resume-site) cmd_ship resume true ;;
     esac
   fi
 }
@@ -1050,19 +1663,19 @@ cmd_self_test() {
   print_header "omarchy-release self-test"
   local current_origin
   current_origin=$(git -C "$BUILD_ROOT" remote get-url origin)
-  if (PKGS_ORIGIN="" PKGS_DB_BASE="" SITE_REPO="" ISO_REPO="" require_release_config) >/dev/null 2>&1; then
+  if (PKGS_ORIGIN="" PKGS_DB_BASE="" SITE_REPO="" ISO_REPO="" ISO_RCLONE_DEST="" require_release_config) >/dev/null 2>&1; then
     echo "  FAIL: missing release infrastructure accepted"
     failures=$((failures + 1))
   else
     echo "  ok: missing release infrastructure rejected"
   fi
-  if (PKGS_ORIGIN="https://packages.example/wrong.git" PKGS_DB_BASE="https://packages.example" SITE_REPO="example/site" ISO_REPO="example/iso" require_release_config) >/dev/null 2>&1; then
+  if (PKGS_ORIGIN="https://packages.example/wrong.git" PKGS_DB_BASE="https://packages.example" SITE_REPO="example/site" ISO_REPO="example/iso" ISO_RCLONE_DEST="example:iso/" require_release_config) >/dev/null 2>&1; then
     echo "  FAIL: mismatched package origin accepted"
     failures=$((failures + 1))
   else
     echo "  ok: mismatched package origin rejected"
   fi
-  if (PKGS_ORIGIN="$current_origin" PKGS_DB_BASE="https://packages.example" SITE_REPO="example/site" ISO_REPO="example/iso" require_release_config) >/dev/null 2>&1; then
+  if (PKGS_ORIGIN="$current_origin" PKGS_DB_BASE="https://packages.example" SITE_REPO="example/site" ISO_REPO="example/iso" ISO_RCLONE_DEST="example:iso/" require_release_config) >/dev/null 2>&1; then
     echo "  ok: explicitly matched release infrastructure accepted"
   else
     echo "  FAIL: explicitly matched release infrastructure rejected"
@@ -1074,7 +1687,7 @@ cmd_self_test() {
     export GIT_CONFIG_VALUE_0="$current_origin"
     export GIT_CONFIG_KEY_1=remote.origin.pushurl
     export GIT_CONFIG_VALUE_1=https://github.com/omacom/omarchy-pkgs.git
-    PKGS_ORIGIN="$current_origin" PKGS_DB_BASE="https://packages.example" SITE_REPO="example/site" ISO_REPO="example/iso" require_release_config
+    PKGS_ORIGIN="$current_origin" PKGS_DB_BASE="https://packages.example" SITE_REPO="example/site" ISO_REPO="example/iso" ISO_RCLONE_DEST="example:iso/" require_release_config
   ) >/dev/null 2>&1; then
     echo "  FAIL: multiple package push destinations accepted"
     failures=$((failures + 1))
@@ -1092,6 +1705,239 @@ cmd_self_test() {
   expect "version_is_patch 5.0.0" "$(version_is_patch 5.0.0 && echo yes || echo no)" "no"
   expect "previous_patch_tag 4.0.2" "$(previous_patch_tag 4.0.2)" "v4.0.1"
   expect "previous_patch_tag 4.0.10" "$(previous_patch_tag 4.0.10)" "v4.0.9"
+  expect "canonical HTTPS repository" "$(canonical_github_repo https://github.com/example/project.git)" "example/project"
+  expect "canonical SSH repository" "$(canonical_github_repo git@github.com:example/project.git)" "example/project"
+  if release_pin_at_ref HEAD >/dev/null; then
+    echo "  ok: current release pins agree"
+  else
+    echo "  FAIL: current release pins are missing, malformed, or divergent"
+    failures=$((failures + 1))
+  fi
+
+  local test_status=0
+  validate_release_modes rc yes false >/dev/null 2>&1 || test_status=$?
+  expect "--no-wait plus --iso rejected" "$test_status" "2"
+  test_status=0
+  validate_release_modes ship no false >/dev/null 2>&1 || test_status=$?
+  expect "--no-wait plus explicit ISO waiver accepted" "$test_status" "0"
+  test_status=0
+  validate_release_modes status yes true >/dev/null 2>&1 || test_status=$?
+  expect "ISO option outside a release command rejected" "$test_status" "2"
+  test_status=0
+  validate_release_modes rc resume true >/dev/null 2>&1 || test_status=$?
+  expect "site resume outside ship rejected" "$test_status" "2"
+  test_status=0
+  validate_command_args ship 1 >/dev/null 2>&1 || test_status=$?
+  expect "unexpected ship argument rejected" "$test_status" "2"
+
+  test_status=0
+  (
+    resolve_tag_commit() { echo aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa; }
+    require_tag_target v4.0.1 aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+  ) >/dev/null 2>&1 || test_status=$?
+  expect "existing tag at pinned commit accepted" "$test_status" "0"
+  test_status=0
+  (
+    resolve_tag_commit() { echo bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb; }
+    require_tag_target v4.0.1 aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+  ) >/dev/null 2>&1 || test_status=$?
+  expect "existing tag at wrong commit rejected" "$test_status" "1"
+  test_status=0
+  (
+    ls_remote() { return 42; }
+    branch_head gnome
+  ) >/dev/null 2>&1 || test_status=$?
+  expect "branch query failure propagates" "$test_status" "2"
+  test_status=0
+  (
+    ls_remote() { return 42; }
+    tag_exists v4.0.1
+  ) >/dev/null 2>&1 || test_status=$?
+  expect "tag query failure propagates" "$test_status" "2"
+  test_status=0
+  (
+    ls_remote() { return 42; }
+    newest_release_branch --untagged
+  ) >/dev/null 2>&1 || test_status=$?
+  expect "release branch query failure propagates" "$test_status" "2"
+
+  local matching_descs divergent_descs
+  matching_descs=$'%FILENAME%\nomarchy-4.0.1-3-any.pkg.tar.zst\n%NAME%\nomarchy\n%VERSION%\n4.0.1-3\n%FILENAME%\nomarchy-settings-4.0.1-3-any.pkg.tar.zst\n%NAME%\nomarchy-settings\n%VERSION%\n4.0.1-3'
+  divergent_descs=${matching_descs/omarchy-settings$'\n'%VERSION%$'\n'4.0.1-3/omarchy-settings$'\n'%VERSION%$'\n'4.0.0-9}
+  expect "matching published package pair accepted" "$(published_pair_from_descs <<<"$matching_descs")" "4.0.1-3"
+  expect "published pkgrel must match the pin" \
+    "$(published_version_matches_pin 4.0.1-3 '4.0.1 1 aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' && echo yes || echo no)" "no"
+  test_status=0
+  published_pair_from_descs <<<"$divergent_descs" >/dev/null 2>&1 || test_status=$?
+  expect "divergent published package pair rejected" "$test_status" "3"
+
+  test_status=0
+  (
+    build_iso() { return 23; }
+    maybe_iso 4.0.1 final yes
+  ) >/dev/null 2>&1 || test_status=$?
+  expect "ISO build failure propagates" "$test_status" "23"
+
+  test_status=0
+  (
+    confirm() { return 1; }
+    build_iso() { return 99; }
+    maybe_iso 4.0.1 final ask
+  ) >/dev/null 2>&1 || test_status=$?
+  expect "declined ISO remains incomplete" "$test_status" "3"
+
+  test_status=0
+  (
+    maybe_iso() { return 23; }
+    update_website() { return 99; }
+    publish_ship_extras 4.0.1 yes
+  ) >/dev/null 2>&1 || test_status=$?
+  expect "ISO failure blocks website update" "$test_status" "23"
+
+  test_status=0
+  (
+    maybe_iso() { ISO_RELEASED=true; return 0; }
+    update_website() { return 29; }
+    publish_ship_extras 4.0.1 yes
+  ) >/dev/null 2>&1 || test_status=$?
+  expect "website publication failure propagates" "$test_status" "29"
+
+  test_status=0
+  (
+    update_website() { return 99; }
+    publish_ship_extras 4.0.1 no
+  ) >/dev/null 2>&1 || test_status=$?
+  expect "explicit ISO waiver skips website" "$test_status" "0"
+
+  test_status=0
+  (
+    verify_published_iso() { return 0; }
+    maybe_iso() { return 99; }
+    update_website() { return 0; }
+    publish_ship_extras 4.0.1 resume
+  ) >/dev/null 2>&1 || test_status=$?
+  expect "site resume verifies without rebuilding ISO" "$test_status" "0"
+
+  local checkout_test_dir
+  checkout_test_dir=$(mktemp -d)
+  git -C "$checkout_test_dir" init --quiet
+  git -C "$checkout_test_dir" -c user.name=Gomarchy -c user.email=release-test@example.invalid \
+    commit --quiet --allow-empty -m initial
+  git -C "$checkout_test_dir" remote add origin https://github.com/example/project.git
+  test_status=0
+  validate_release_checkout "$checkout_test_dir" example/project >/dev/null 2>&1 || test_status=$?
+  expect "clean release checkout accepted" "$test_status" "0"
+  test_status=0
+  validate_release_checkout "$checkout_test_dir" example/project write >/dev/null 2>&1 || test_status=$?
+  expect "matching release push origin accepted" "$test_status" "0"
+  git -C "$checkout_test_dir" remote set-url --push origin https://github.com/example/wrong.git
+  test_status=0
+  validate_release_checkout "$checkout_test_dir" example/project write >/dev/null 2>&1 || test_status=$?
+  expect "mismatched release push origin rejected" "$test_status" "1"
+  git -C "$checkout_test_dir" remote set-url --push origin https://github.com/example/project.git
+  git -C "$checkout_test_dir" remote set-url origin example/project
+  test_status=0
+  validate_release_checkout "$checkout_test_dir" example/project >/dev/null 2>&1 || test_status=$?
+  expect "non-GitHub release origin rejected" "$test_status" "1"
+  git -C "$checkout_test_dir" remote set-url origin https://github.com/example/project.git
+
+  write_pin_fixture() { # write_pin_fixture <tag> <commit> <version> <rel> <sha> [source]
+    local tag="$1" commit="$2" version="$3" rel="$4" sha="$5" source="${6:-pinned}" pkg
+    for pkg in omarchy omarchy-settings; do
+      mkdir -p "$checkout_test_dir/pkgbuilds/$pkg"
+      {
+        printf "_tag='%s'\n" "$tag"
+        printf "_commit='%s'\n" "$commit"
+        printf 'pkgver=%s\n' "$version"
+        printf 'pkgrel=%s\n' "$rel"
+        printf "pkgname='%s'\n" "$pkg"
+        if [[ "$source" == pinned ]]; then
+          printf '%s\n' 'source=("https://example.invalid/${_commit}.tar.gz")'
+        else
+          printf '%s\n' 'source=("https://evil.invalid/unpinned.tar.gz")'
+        fi
+        printf '%s\n' 'if [[ -n ${OMARCHY_SRC:-} ]]; then'
+        printf '%s\n' '  sha256sums=()'
+        printf '%s\n' 'else'
+        printf "  sha256sums=('%s')\n" "$sha"
+        printf '%s\n' 'fi'
+      } >"$checkout_test_dir/pkgbuilds/$pkg/PKGBUILD"
+    done
+  }
+
+  write_pin_fixture v4.0.0 aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa 4.0.0 3 \
+    aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+  git -C "$checkout_test_dir" add pkgbuilds
+  git -C "$checkout_test_dir" -c user.name=Gomarchy -c user.email=release-test@example.invalid \
+    commit --quiet -m baseline-pkgbuilds
+  local fixture_master
+  fixture_master=$(git -C "$checkout_test_dir" rev-parse HEAD)
+  git -C "$checkout_test_dir" update-ref refs/remotes/origin/master "$fixture_master"
+
+  write_pin_fixture v4.0.1 bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb 4.0.1 1 \
+    bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+  git -C "$checkout_test_dir" add pkgbuilds
+  git -C "$checkout_test_dir" -c user.name=Gomarchy -c user.email=release-test@example.invalid \
+    commit --quiet -m exact-pin-scope
+  test_status=0
+  release_pin_commit_has_exact_scope HEAD "$checkout_test_dir" >/dev/null 2>&1 || test_status=$?
+  expect "exact pin commit scope accepted" "$test_status" "0"
+  test_status=0
+  release_pin_branch_matches_master HEAD "$checkout_test_dir" refs/remotes/origin/master >/dev/null 2>&1 || test_status=$?
+  expect "single pin commit on master accepted" "$test_status" "0"
+  expect "exact fixture pin accepted" "$(release_pin_at_ref HEAD "$checkout_test_dir")" \
+    "4.0.1 1 bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+
+  write_pin_fixture '' cccccccccccccccccccccccccccccccccccccccc 4.0.2 1 \
+    cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc evil
+  git -C "$checkout_test_dir" add pkgbuilds
+  git -C "$checkout_test_dir" -c user.name=Gomarchy -c user.email=release-test@example.invalid \
+    commit --quiet -m malicious-pin-source
+  test_status=0
+  release_pin_commit_has_exact_scope HEAD "$checkout_test_dir" >/dev/null 2>&1 || test_status=$?
+  expect "pin commit source mutation rejected" "$test_status" "1"
+
+  write_pin_fixture '' dddddddddddddddddddddddddddddddddddddddd 4.0.3 1 \
+    dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd evil
+  git -C "$checkout_test_dir" add pkgbuilds
+  git -C "$checkout_test_dir" -c user.name=Gomarchy -c user.email=release-test@example.invalid \
+    commit --quiet -m metadata-tip-over-malicious-parent
+  test_status=0
+  release_pin_commit_has_exact_scope HEAD "$checkout_test_dir" >/dev/null 2>&1 || test_status=$?
+  expect "metadata-only tip has valid local scope" "$test_status" "0"
+  test_status=0
+  release_pin_branch_matches_master HEAD "$checkout_test_dir" refs/remotes/origin/master >/dev/null 2>&1 || test_status=$?
+  expect "pin tip with non-master parent rejected" "$test_status" "1"
+
+  printf "_commit='eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee'\n" >>"$checkout_test_dir/pkgbuilds/omarchy/PKGBUILD"
+  printf "_commit='eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee'\n" >>"$checkout_test_dir/pkgbuilds/omarchy-settings/PKGBUILD"
+  git -C "$checkout_test_dir" add pkgbuilds
+  git -C "$checkout_test_dir" -c user.name=Gomarchy -c user.email=release-test@example.invalid \
+    commit --quiet -m duplicate-pin-fields
+  test_status=0
+  release_pin_at_ref HEAD "$checkout_test_dir" >/dev/null 2>&1 || test_status=$?
+  expect "duplicate pin assignments rejected" "$test_status" "1"
+
+  printf 'extra\n' >"$checkout_test_dir/extra"
+  git -C "$checkout_test_dir" add extra
+  git -C "$checkout_test_dir" -c user.name=Gomarchy -c user.email=release-test@example.invalid \
+    commit --quiet -m broad-pin-scope
+  test_status=0
+  release_pin_commit_has_exact_scope HEAD "$checkout_test_dir" >/dev/null 2>&1 || test_status=$?
+  expect "broad pin commit scope rejected" "$test_status" "1"
+
+  cp "$checkout_test_dir/.git/index" "$checkout_test_dir/.git/index.valid"
+  printf 'invalid-index\n' >"$checkout_test_dir/.git/index"
+  test_status=0
+  validate_release_checkout "$checkout_test_dir" example/project >/dev/null 2>&1 || test_status=$?
+  expect "unreadable checkout status rejected" "$test_status" "1"
+  mv "$checkout_test_dir/.git/index.valid" "$checkout_test_dir/.git/index"
+
+  printf 'dirty\n' >"$checkout_test_dir/untracked"
+  test_status=0
+  validate_release_checkout "$checkout_test_dir" example/project >/dev/null 2>&1 || test_status=$?
+  expect "dirty release checkout rejected" "$test_status" "1"
+  rm -rf -- "$checkout_test_dir"
   echo ""
   if ((failures == 0)); then
     print_success "Self-test passed"
@@ -1105,26 +1951,49 @@ cmd_self_test() {
 
 COMMAND=""
 ISO_MODE="ask"
+ISO_MODE_SET=false
 WAIT=true
 ARGS=()
 while [[ $# -gt 0 ]]; do
   case $1 in
   --yes) ASSUME_YES=true; shift ;;
   --host)
+    [[ $# -ge 2 && -n "$2" ]] || {
+      print_error "--host requires an ssh destination"
+      exit 2
+    }
     REPO_HOST_OVERRIDE="$2"
     export OMARCHY_REPO_HOST="$2" # child bin/repo invocations forward to it too
     shift 2
     ;;
-  --iso) ISO_MODE="yes"; shift ;;
-  --no-iso) ISO_MODE="no"; shift ;;
+  --iso | --no-iso | --resume-site)
+    requested_iso_mode="yes"
+    [[ "$1" == "--no-iso" ]] && requested_iso_mode="no"
+    [[ "$1" == "--resume-site" ]] && requested_iso_mode="resume"
+    if [[ "$ISO_MODE_SET" == true && "$ISO_MODE" != "$requested_iso_mode" ]]; then
+      print_error "--iso, --no-iso, and --resume-site are mutually exclusive"
+      exit 2
+    fi
+    ISO_MODE="$requested_iso_mode"
+    ISO_MODE_SET=true
+    shift
+    ;;
   --no-wait) WAIT=false; shift ;;
   -h | --help) show_usage; exit 0 ;;
   start | pick | rc | ship | status | doctor | self-test)
+    if [[ -n "$COMMAND" ]]; then
+      print_error "Multiple commands supplied: $COMMAND and $1"
+      exit 2
+    fi
     COMMAND="$1"; shift ;;
+  -*) print_error "Unknown option: $1"; show_usage; exit 2 ;;
   *)
     ARGS+=("$1"); shift ;;
   esac
 done
+
+validate_release_modes "$COMMAND" "$ISO_MODE" "$WAIT" || exit $?
+validate_command_args "$COMMAND" "${#ARGS[@]}" || exit $?
 
 case "$COMMAND" in
 start) cmd_start "${ARGS[@]}" ;;
