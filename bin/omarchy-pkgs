@@ -22,12 +22,41 @@ source "$BUILD_ROOT/helpers/message-helpers.sh"
 source "$BUILD_ROOT/helpers/paths.sh"
 source "$BUILD_ROOT/helpers/host-helpers.sh"
 
-UPSTREAM_URL="${OMARCHY_UPSTREAM_URL:-https://github.com/basecamp/omarchy.git}"
-EDGE_DB_URL="${OMARCHY_EDGE_DB_URL:-https://pkgs.omarchy.org/edge/x86_64/omarchy.db.tar.zst}"
+UPSTREAM_URL="${OMARCHY_UPSTREAM_URL:-https://github.com/carlosferrerdev/prumo.git}"
+EDGE_DB_URL="${OMARCHY_EDGE_DB_URL:-}"
+PKGS_ORIGIN="${OMARCHY_PKGS_ORIGIN:-}"
 RELEASE_PACKAGES=(omarchy omarchy-settings)
-DEFAULT_RC_REF="quattro"
+DEFAULT_RC_REF="gnome"
 SRCDEST_DIR="$BUILD_ROOT/.srcdest"
 CLONE_DIR="$SRCDEST_DIR/omarchy"
+
+require_release_config() {
+  local no_push="$1" dry_run="$2" push_url
+  local push_urls=()
+
+  if [[ -z "$EDGE_DB_URL" ]]; then
+    print_error "OMARCHY_EDGE_DB_URL is required for Gomarchy releases"
+    print_error "Point it at the intended Gomarchy channel database; refusing to use Omarchy production implicitly"
+    exit 1
+  fi
+
+  if [[ "$no_push" == true || "$dry_run" == true ]]; then
+    return 0
+  fi
+  if [[ -z "$PKGS_ORIGIN" ]]; then
+    print_error "OMARCHY_PKGS_ORIGIN is required before pushing a Gomarchy release"
+    exit 1
+  fi
+  while IFS= read -r push_url; do
+    [[ -n "$push_url" ]] && push_urls+=("$push_url")
+  done < <(git -C "$BUILD_ROOT" remote get-url --push --all origin 2>/dev/null || true)
+  if (( ${#push_urls[@]} != 1 )) || [[ "${push_urls[0]:-}" != "$PKGS_ORIGIN" ]]; then
+    print_error "Package push origin mismatch: expected exactly '$PKGS_ORIGIN'"
+    print_error "Found ${#push_urls[@]} push destination(s): ${push_urls[*]:-<none>}"
+    print_error "Refusing to push release metadata to an unverified repository"
+    exit 1
+  fi
+}
 
 show_usage() {
   cat <<EOF
@@ -35,7 +64,7 @@ Usage: $0 <command> [options]
 
 Commands:
   release <vX.Y.Z | vX.Y.Z-rcN>  Cut a release from an upstream tag; if the
-                                 tag doesn't exist, uses the tip of quattro
+                                 tag doesn't exist, uses the tip of gnome
                                  (or --ref/--commit) with that version
   release latest [rc|beta|alpha] Cut from the newest upstream tag, optionally
                                  restricted to one pre-release channel
@@ -396,6 +425,8 @@ cmd_release() {
     exit 1
   fi
 
+  require_release_config "$no_push" "$dry_run"
+
   print_header "Omarchy Release"
 
   # Fail fast on a dirty tree before touching the network. --no-push commits
@@ -440,7 +471,7 @@ cmd_release() {
       tag=$(latest_channel_tag "$channel" "$base" || true)
       if [[ -z "$tag" ]]; then
         print_error "No v$base-${channel}N tag found at $UPSTREAM_URL"
-        print_error "Tag one upstream (on quattro), or cut an untagged ${channel} with: $0 release $channel --commit <sha> --base $base"
+        print_error "Tag one upstream (on gnome), or cut an untagged ${channel} with: $0 release $channel --commit <sha> --base $base"
         exit 1
       fi
       pkgver=$(normalize_tag "$tag")
@@ -636,6 +667,41 @@ cmd_self_test() {
   }
 
   print_header "omarchy-pkgs self-test"
+
+  echo "Release destination guards:"
+  if (EDGE_DB_URL="" require_release_config true false) >/dev/null 2>&1; then
+    echo "  FAIL: missing channel database accepted"
+    failures=$((failures + 1))
+  else
+    echo "  ok: missing channel database rejected"
+  fi
+  if (EDGE_DB_URL="https://packages.example/edge.db" PKGS_ORIGIN="" require_release_config false false) >/dev/null 2>&1; then
+    echo "  FAIL: push without a declared package origin accepted"
+    failures=$((failures + 1))
+  else
+    echo "  ok: push without a declared package origin rejected"
+  fi
+  local current_origin
+  current_origin=$(git -C "$BUILD_ROOT" remote get-url origin)
+  if (EDGE_DB_URL="https://packages.example/edge.db" PKGS_ORIGIN="$current_origin" require_release_config false false) >/dev/null 2>&1; then
+    echo "  ok: explicitly matched release destinations accepted"
+  else
+    echo "  FAIL: explicitly matched release destinations rejected"
+    failures=$((failures + 1))
+  fi
+  if (
+    export GIT_CONFIG_COUNT=2
+    export GIT_CONFIG_KEY_0=remote.origin.pushurl
+    export GIT_CONFIG_VALUE_0="$current_origin"
+    export GIT_CONFIG_KEY_1=remote.origin.pushurl
+    export GIT_CONFIG_VALUE_1=https://github.com/omacom/omarchy-pkgs.git
+    EDGE_DB_URL="https://packages.example/edge.db" PKGS_ORIGIN="$current_origin" require_release_config false false
+  ) >/dev/null 2>&1; then
+    echo "  FAIL: multiple package push destinations accepted"
+    failures=$((failures + 1))
+  else
+    echo "  ok: multiple package push destinations rejected"
+  fi
 
   echo "Tag normalization:"
   check_norm v4.0.0 4.0.0

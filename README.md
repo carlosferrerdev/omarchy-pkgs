@@ -429,7 +429,7 @@ bin/package-worktree v4l2-relayd     # Create upstream/patched/current scratch w
 ## Cutting an Omarchy Release
 
 The `omarchy` and `omarchy-settings` packages are released as a pair, always
-built from the same upstream commit of basecamp/omarchy.
+built from the same source commit of carlosferrerdev/prumo.
 
 **Use `bin/omarchy-release`** (see [Cutting an Omarchy release](#cutting-an-omarchy-release)
 in Quick Start) — it drives the whole train across all four repositories and
@@ -442,12 +442,19 @@ the current branch. Driven by `omarchy-release` it pins to the release branch
 on the `rc` branch and orders against the rc channel; invoked directly it
 targets the current branch and edge.
 
+Release destinations deliberately have no Omarchy production defaults. Before
+any mutating release command, configure `OMARCHY_PKGS_ORIGIN`,
+`OMARCHY_PKGS_DB_BASE`, `OMARCHY_SITE_REPO`, and `OMARCHY_ISO_REPO` for the
+Gomarchy infrastructure. Direct `bin/omarchy-pkgs release` calls also require
+`OMARCHY_EDGE_DB_URL`; `--no-push` and `--dry-run` skip only the package-origin
+check, never the channel-database check.
+
 ```bash
 bin/omarchy-pkgs release v4.0.0          # Final release from the upstream v4.0.0 tag
 bin/omarchy-pkgs release rc v4.0.0       # Newest upstream v4.0.0-rcN tag -> 4.0.0rcN
 bin/omarchy-pkgs release beta v4.0.0     # Same for beta (alpha also supported)
 bin/omarchy-pkgs release latest          # Newest upstream tag, rc/beta included (prompts)
-bin/omarchy-pkgs release rc              # Untagged RC from the quattro tip, auto-numbered
+bin/omarchy-pkgs release rc              # Untagged RC from the gnome tip, auto-numbered
 bin/omarchy-pkgs release --commit abc123 --base 4.1.0   # Untagged RC from a commit
 bin/omarchy-pkgs release ... --dry-run   # Show the plan; write nothing
 bin/omarchy-pkgs release ... --no-push   # Full flow, local commit only (testing)
@@ -462,7 +469,7 @@ bin/omarchy-pkgs self-test               # Version normalization + ordering test
   (`4.0.0.rc1`, `4.0.0_rc1`) sort **after** `4.0.0` and would strand users on
   the pre-release — the tooling normalizes upstream tags (`v4.0.0-rc1`,
   `v4.0.0-rc.1`, ...) to the attached form and refuses anything it cannot
-  normalize. Upstream tags are cut on the quattro branch.
+  normalize. Gomarchy tags are cut on the gnome branch.
 - `pkgrel` resets to 1 on every version change. Bump `pkgrel` by hand only to
   repackage the same source.
 - `epoch` is never set by tooling. It is sticky forever; adding one is a
