@@ -11,7 +11,7 @@
 #    omarchy-settings must always carry identical _tag/_commit/pkgver/sha256sums.
 pkgname='omarchy'
 _tag=''
-_commit='7ba81c59db2f7c79cbbe985110497c4d1b93486e'
+_commit='76ca53b7dc0a2e0eebf57cc4f022745af29f85ef'
 pkgver=4.0.1
 pkgrel=2
 pkgdesc='Opinionated GNOME desktop experience for Arch Linux developers'
@@ -80,7 +80,7 @@ if [[ -n "${OMARCHY_SRC:-}" ]]; then
   sha256sums=()
 else
   source=("omarchy::git+https://github.com/carlosferrerdev/prumo.git#commit=${_commit}")
-  sha256sums=('6829bccaebeb87b4b6da008b5d1fcb6347dd53da180e5e700a2baa4a87c127c1')
+  sha256sums=('4f62a4e72948cdcaf2516c0391557beae53b835ee6d567eb43eaa23b68b11a5a')
 fi
 
 prepare() {
