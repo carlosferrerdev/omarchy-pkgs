@@ -10,13 +10,13 @@
 #    provenance only (empty when cut from a bare commit). omarchy and
 #    omarchy-settings must always carry identical _tag/_commit/pkgver/sha256sums.
 pkgname='omarchy'
-_tag='v4.0.1'
-_commit='13f18b2cb7286fb54f87daf571a031aa6af3d8f0'
+_tag=''
+_commit='329ea91f3eebc06033b88741c513521b16bca62b'
 pkgver=4.0.1
-pkgrel=1
-pkgdesc='Beautiful, modern, and opinionated Arch Linux by DHH'
+pkgrel=2
+pkgdesc='Opinionated GNOME desktop experience for Arch Linux developers'
 arch=('any')
-url='https://github.com/basecamp/omarchy'
+url='https://github.com/carlosferrerdev/prumo'
 license=('MIT')
 conflicts=('omarchy-dev')
 # Hard depends: only packages whose removal would brick the desktop. The ISO
@@ -79,8 +79,8 @@ if [[ -n "${OMARCHY_SRC:-}" ]]; then
   source=()
   sha256sums=()
 else
-  source=("omarchy::git+https://github.com/basecamp/omarchy.git#commit=${_commit}")
-  sha256sums=('817e611fec23c8768825843aece12b2b8f4c3a3a2f71953dcb0129f54f44b1af')
+  source=("omarchy::git+https://github.com/carlosferrerdev/prumo.git#commit=${_commit}")
+  sha256sums=('7f090797a2844dd83cf0361cfe06c3345f109cd4a61ad0e7b3b001f0921d79c9')
 fi
 
 prepare() {

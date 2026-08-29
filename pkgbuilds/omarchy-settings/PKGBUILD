@@ -10,13 +10,13 @@
 #    provenance only (empty when cut from a bare commit). omarchy and
 #    omarchy-settings must always carry identical _tag/_commit/pkgver/sha256sums.
 pkgname='omarchy-settings'
-_tag='v4.0.1'
-_commit='13f18b2cb7286fb54f87daf571a031aa6af3d8f0'
+_tag=''
+_commit='329ea91f3eebc06033b88741c513521b16bca62b'
 pkgver=4.0.1
-pkgrel=1
-pkgdesc='Omarchy user defaults, /etc/skel content, fonts, plymouth theme, and support helpers'
+pkgrel=2
+pkgdesc='Gomarchy user defaults, session integration, and support helpers'
 arch=('any')
-url='https://github.com/basecamp/omarchy'
+url='https://github.com/carlosferrerdev/prumo'
 license=('MIT')
 conflicts=('omarchy-settings-dev')
 
@@ -108,8 +108,8 @@ if [[ -n "${OMARCHY_SRC:-}" ]]; then
   source=()
   sha256sums=()
 else
-  source=("omarchy::git+https://github.com/basecamp/omarchy.git#commit=${_commit}")
-  sha256sums=('817e611fec23c8768825843aece12b2b8f4c3a3a2f71953dcb0129f54f44b1af')
+  source=("omarchy::git+https://github.com/carlosferrerdev/prumo.git#commit=${_commit}")
+  sha256sums=('7f090797a2844dd83cf0361cfe06c3345f109cd4a61ad0e7b3b001f0921d79c9')
 fi
 
 prepare() {
@@ -146,6 +146,9 @@ package() {
   # ~/.config/mimeapps.list, and ~/.config/systemd/user can all override these.
   install -Dm644 default/uwsm/env.d/10-omarchy "$pkgdir/usr/share/uwsm/env.d/10-omarchy"
   install -Dm644 default/environment.d/10-omarchy-fcitx.conf "$pkgdir/usr/lib/environment.d/10-omarchy-fcitx.conf"
+  install -Dm644 default/environment.d/20-omarchy-session.conf "$pkgdir/usr/lib/environment.d/20-omarchy-session.conf"
+  install -Dm755 default/systemd/user-environment-generators/60-omarchy-dev-path \
+    "$pkgdir/usr/lib/systemd/user-environment-generators/60-omarchy-dev-path"
   # GNOME session-mode quartet. The GNOME desktop ID stays distinct from the
   # retained /usr/local Omarchy Hyprland session during the coexistence phase.
   install -Dm644 default/gnome-shell/modes/gomarchy.json "$pkgdir/usr/share/gnome-shell/modes/gomarchy.json"
@@ -215,7 +218,7 @@ ANSI_COLOR="38;2;158;206;106"
 HOME_URL="https://omarchy.org/"
 DOCUMENTATION_URL="https://learn.omacom.io/2/the-omarchy-manual"
 SUPPORT_URL="https://discord.gg/tXFUdasqhY"
-BUG_REPORT_URL="https://github.com/basecamp/omarchy/issues"
+BUG_REPORT_URL="https://github.com/carlosferrerdev/prumo/issues"
 LOGO=omarchy
 EOF
   for path in "${_etc_override_paths[@]}"; do

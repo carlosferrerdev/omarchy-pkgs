@@ -1,12 +1,11 @@
 # Maintainer: Ryan Hughes <ryan@omarchy.org>
 pkgname='omarchy-dev'
-pkgver=4.0.0.r847.g4de185b
+pkgver=4.0.0.r6186.g329ea91
 pkgrel=1
 _pkgver_base=4.0.0
-_pkgver_base_tag=v3.8.2
-pkgdesc='Beautiful, modern, and opinionated Arch Linux by DHH (quattro branch tip)'
+pkgdesc='Opinionated GNOME desktop experience for Arch Linux developers (gnome branch tip)'
 arch=('any')
-url='https://github.com/basecamp/omarchy'
+url='https://github.com/carlosferrerdev/prumo'
 license=('MIT')
 provides=('omarchy')
 conflicts=('omarchy')
@@ -59,13 +58,13 @@ makedepends=(
   'git'
 )
 
-# Source: quattro branch tip by default; set OMARCHY_SRC=/path/to/checkout
+# Source: gnome branch tip by default; set OMARCHY_SRC=/path/to/checkout
 # to build from a local source tree instead (mirrors omarchy-zsh/omarchy-fish DX).
 if [[ -n "${OMARCHY_SRC:-}" ]]; then
   source=()
   sha256sums=()
 else
-  source=("omarchy::git+https://github.com/basecamp/omarchy.git#branch=quattro")
+  source=("omarchy::git+https://github.com/carlosferrerdev/prumo.git#branch=gnome")
   sha256sums=('SKIP')
 fi
 
@@ -73,11 +72,7 @@ pkgver() {
   cd "$srcdir/omarchy"
 
   local commit_count commit_hash
-  if git rev-parse --verify "${_pkgver_base_tag}^{commit}" >/dev/null 2>&1; then
-    commit_count=$(git rev-list --count "${_pkgver_base_tag}..HEAD")
-  else
-    commit_count=$(git rev-list --count HEAD)
-  fi
+  commit_count=$(git rev-list --count HEAD)
   commit_hash=$(git rev-parse --short=7 HEAD)
 
   printf "%s.r%s.g%s" "$_pkgver_base" "$commit_count" "$commit_hash"
