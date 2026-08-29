@@ -1,6 +1,6 @@
 # Maintainer: Ryan Hughes <ryan@omarchy.org>
 pkgname='omarchy-settings-dev'
-pkgver=4.0.0.r6191.ga1d7152
+pkgver=4.0.0.r6192.gc16fc90
 pkgrel=1
 _pkgver_base=4.0.0
 pkgdesc='Gomarchy user defaults, session integration, and support helpers (gnome branch tip)'
