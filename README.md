@@ -727,7 +727,7 @@ bin/repo release --package my-package
 
 ### Apple T2 package closure
 
-The signed Gomarchy channel must carry `apple-t2-audio-config`, `linux-t2`, `linux-t2-headers`, `t2fanrd`, and `apple-bcm-firmware` before an ISO can claim the complete T2 platform closure. This repository builds the first four from pinned, checksummed, redistributable sources. It deliberately does not create an `apple-bcm-firmware` package: the available upstream recipe labels the proprietary firmware license unknown and downloads mutable blobs without integrity hashes. `policy/t2-packages.json` records the boundary, and tests fail closed until firmware is supplied by the machine owner from their macOS installation or explicit redistribution terms plus an immutable checksummed source are available.
+The signed Gomarchy channel must carry `apple-t2-audio-config`, `linux-t2`, `linux-t2-headers`, and `t2fanrd` before an ISO can claim the redistributable T2 platform closure. This repository builds all four from pinned, checksummed sources. It deliberately does not create or publish an `apple-bcm-firmware` package: the available upstream recipe labels the proprietary firmware license unknown and downloads mutable blobs without integrity hashes. A T2 Mac owner instead follows the official t2linux guide while macOS is still available, then runs `omarchy setup t2-firmware` with their `firmware.tar` or `apple-firmware` package. The runtime validates the artifact, discards supplied installation code, and installs a sanitized local package. `policy/t2-packages.json` records and tests this public/private boundary; only explicit redistribution terms plus an immutable checksummed source can move the firmware into the public channel.
 
 ### Building for Both Architectures
 

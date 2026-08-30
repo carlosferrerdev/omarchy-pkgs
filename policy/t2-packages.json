@@ -1,7 +1,6 @@
 {
-  "schema": 1,
+  "schema": 2,
   "required_packages": [
-    "apple-bcm-firmware",
     "apple-t2-audio-config",
     "linux-t2",
     "linux-t2-headers",
@@ -38,10 +37,22 @@
       "maintenance": "Active; pinned upstream change from 2026-04-28."
     }
   },
+  "owner_supplied": {
+    "apple-firmware": {
+      "guide": "https://wiki.t2linux.org/guides/wifi-bluetooth/",
+      "accepted_artifacts": [
+        "firmware.tar",
+        "apple-firmware-*-any.pkg.tar.zst"
+      ],
+      "runtime_command": "omarchy setup t2-firmware",
+      "sanitized_package": "gomarchy-apple-t2-firmware-local",
+      "public_repository": false
+    }
+  },
   "blocked": {
     "apple-bcm-firmware": {
       "reason": "The upstream recipe declares the firmware license unknown and downloads proprietary firmware blobs from a legacy third-party mirror without integrity hashes.",
-      "resolution": "Require user-supplied firmware extracted from an owned macOS installation, or obtain explicit redistribution terms and an immutable checksummed source."
+      "resolution": "Use the owner-supplied local artifact flow, or obtain explicit redistribution terms and an immutable checksummed source before any public package is created."
     }
   }
 }

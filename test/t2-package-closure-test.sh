@@ -21,16 +21,15 @@ command -v jq >/dev/null 2>&1 || {
 }
 
 expected_required=$(printf '%s\n' \
-  apple-bcm-firmware \
   apple-t2-audio-config \
   linux-t2 \
   linux-t2-headers \
   t2fanrd | sort)
 actual_required=$(jq -r '.required_packages[]' "$POLICY" | sort)
 if [[ $actual_required == "$expected_required" ]]; then
-  pass 'T2 policy tracks all five ISO package names'
+  pass 'T2 policy tracks all four redistributable ISO package names'
 else
-  fail 'T2 policy tracks all five ISO package names'
+  fail 'T2 policy tracks all four redistributable ISO package names'
 fi
 
 actual_outputs=$(
@@ -78,10 +77,13 @@ fi
 
 if [[ ! -e $ROOT_DIR/pkgbuilds/apple-bcm-firmware ]] &&
   [[ $(jq -r '.blocked["apple-bcm-firmware"].reason // empty' "$POLICY") == *license* ]] &&
-  [[ $(jq -r '.blocked["apple-bcm-firmware"].resolution // empty' "$POLICY") == *user-supplied* ]]; then
-  pass 'unlicensed Apple firmware remains an explicit fail-closed blocker'
+  [[ $(jq -r '.blocked["apple-bcm-firmware"].resolution // empty' "$POLICY") == *owner-supplied* ]] &&
+  [[ $(jq -r '.owner_supplied["apple-firmware"].public_repository' "$POLICY") == false ]] &&
+  [[ $(jq -r '.owner_supplied["apple-firmware"].runtime_command' "$POLICY") == 'omarchy setup t2-firmware' ]] &&
+  [[ $(jq -r '.owner_supplied["apple-firmware"].sanitized_package' "$POLICY") == 'gomarchy-apple-t2-firmware-local' ]]; then
+  pass 'unlicensed Apple firmware remains outside publication and uses the owner-local flow'
 else
-  fail 'unlicensed Apple firmware remains an explicit fail-closed blocker'
+  fail 'unlicensed Apple firmware remains outside publication and uses the owner-local flow'
 fi
 
 if grep -Eq '^sha256sums=' "$ROOT_DIR/pkgbuilds/apple-t2-audio-config/PKGBUILD" &&
