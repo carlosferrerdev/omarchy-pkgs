@@ -11,9 +11,9 @@
 #    omarchy-settings must always carry identical _tag/_commit/pkgver/sha256sums.
 pkgname='omarchy-settings'
 _tag=''
-_commit='7e7bd5fe84be15989aeb3c632ac634dd532549c7'
+_commit='f3f4363df546a80e00146813a00661aa2a09ce22'
 pkgver=4.0.1
-pkgrel=4
+pkgrel=5
 pkgdesc='Gomarchy user defaults, session integration, and support helpers'
 arch=('any')
 url='https://github.com/carlosferrerdev/prumo'
@@ -108,7 +108,7 @@ if [[ -n "${OMARCHY_SRC:-}" ]]; then
   sha256sums=()
 else
   source=("omarchy::git+https://github.com/carlosferrerdev/prumo.git#commit=${_commit}")
-  sha256sums=('d7845c02900331c9ad58bfea94ce382aaeea84fa5e5ac25813893edb55da979c')
+  sha256sums=('6e5a88b2b99cbd5b2783e9a4426203114456cf2b05e6deab8c8b4223a4b3e756')
 fi
 
 prepare() {
