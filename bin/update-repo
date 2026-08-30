@@ -1,65 +1,374 @@
 #!/bin/bash
-# Omarchy Repository Database Manager
-# Updates the repository database with all packages
+# Build, sign, and transactionally activate the repository database.
 
-set -e
+set -euo pipefail
 
-# Source common functions
+unset GPG_PRIVATE_KEY GPG_PASSPHRASE
+
 BUILD_ROOT=$(realpath "${BASH_SOURCE[0]%/*}/..")
 source "$BUILD_ROOT/helpers/message-helpers.sh"
 source "$BUILD_ROOT/helpers/docker-helpers.sh"
 source "$BUILD_ROOT/helpers/paths.sh"
 source "$BUILD_ROOT/helpers/lock-helpers.sh"
+source "$BUILD_ROOT/helpers/signing-secret-helpers.sh"
 
-# Function to update repository database using Docker
-update_database() {
-  print_info "Updating repository database in Docker container..."
+SIGNING_GNUPGHOME=""
+SIGNING_FINGERPRINT=""
+SIGNING_PASSPHRASE_FILE=""
+DB_STAGE_DIR=""
 
-  # Check Docker is available
-  check_docker
+cleanup() {
+  if [[ -n $SIGNING_GNUPGHOME && -d $SIGNING_GNUPGHOME ]]; then
+    gpgconf --homedir "$SIGNING_GNUPGHOME" --kill gpg-agent >/dev/null 2>&1 || true
+    rm -rf -- "$SIGNING_GNUPGHOME"
+  fi
+  if [[ -n $DB_STAGE_DIR && -d $DB_STAGE_DIR ]]; then
+    case "$DB_STAGE_DIR" in
+      "$REPO_DIR"/.omarchy-db-stage.*) rm -rf -- "$DB_STAGE_DIR" ;;
+    esac
+  fi
+}
+trap cleanup EXIT
 
-  # Ensure output directory exists
-  if [[ ! -d "$REPO_DIR" ]]; then
-    print_error "Output directory not found: $REPO_DIR"
-    print_warning "Run bin/repo build first"
+require_value() {
+  if [[ $# -lt 2 || -z $2 ]]; then
+    print_error "Option $1 requires a value"
     exit 1
   fi
-
-  # Make output directory writable for container
-  make_dir_writable "$REPO_DIR"
-
-  # repo-add is architecture- and mirror-independent, so always use the edge
-  # x86_64 image. This also lets bootstrap-rc build the rc database before the
-  # rc channel exists remotely (an rc image can only build after it does).
-  build_docker_image "$BUILD_DIR" "x86_64" "edge"
-
-  docker run --rm --platform linux/amd64 \
-    -e ARCH="$ARCH" \
-    -e MIRROR="$MIRROR" \
-    -v "$REPO_ROOT:/output" \
-    -v "$BUILD_DIR:/build:ro" \
-    omarchy-pkg-builder:latest-x86_64-edge /build/update-repo.sh
 }
 
-# Main execution
+prepare_signing_keyring() {
+  local key_record
+
+  validate_signing_secret_pair || return 1
+  [[ ${OMARCHY_PKGS_SIGNING_KEY_FINGERPRINT:-} =~ ^[[:xdigit:]]{40}$ ]] || {
+    print_error "OMARCHY_PKGS_SIGNING_KEY_FINGERPRINT must be a full 40-character hexadecimal fingerprint"
+    return 1
+  }
+  SIGNING_FINGERPRINT=$(printf '%s' "$OMARCHY_PKGS_SIGNING_KEY_FINGERPRINT" | tr '[:lower:]' '[:upper:]')
+  [[ $SIGNING_FINGERPRINT != 40DFB630FF42BCFFB047046CF0134EE680CAC571 ]] || {
+    print_error "The historical upstream package-signing fingerprint is forbidden"
+    return 1
+  }
+  command -v gpg >/dev/null 2>&1 || {
+    print_error "gpg is required to sign repository databases"
+    return 1
+  }
+
+  SIGNING_GNUPGHOME=$(mktemp -d)
+  chmod 0700 "$SIGNING_GNUPGHOME"
+  install -m 0600 "$OMARCHY_PKGS_SIGNING_PRIVATE_KEY_FILE" \
+    "$SIGNING_GNUPGHOME/private-key.asc"
+  SIGNING_PASSPHRASE_FILE="$SIGNING_GNUPGHOME/passphrase"
+  install -m 0600 "$OMARCHY_PKGS_SIGNING_PASSPHRASE_FILE" "$SIGNING_PASSPHRASE_FILE"
+  unset OMARCHY_PKGS_SIGNING_PRIVATE_KEY_FILE OMARCHY_PKGS_SIGNING_PASSPHRASE_FILE
+
+  if ! gpg --batch --homedir "$SIGNING_GNUPGHOME" \
+    --import "$SIGNING_GNUPGHOME/private-key.asc" >/dev/null 2>&1; then
+    print_error "Could not import OMARCHY_PKGS_SIGNING_PRIVATE_KEY_FILE"
+    return 1
+  fi
+  rm -f -- "$SIGNING_GNUPGHOME/private-key.asc"
+
+  if ! key_record=$(
+    gpg --batch --homedir "$SIGNING_GNUPGHOME" --with-colons --fingerprint --fingerprint \
+      --list-secret-keys 2>/dev/null |
+      awk -F: -v wanted="$SIGNING_FINGERPRINT" '
+        $1 == "sec" || $1 == "ssb" {
+          key_type = $1
+          validity = $2
+          capabilities = $12
+          next
+        }
+        key_type != "" && $1 == "fpr" {
+          if (toupper($10) == wanted) {
+            matches++
+            matched_type = key_type
+            matched_validity = validity
+            matched_capabilities = capabilities
+          }
+          key_type = ""
+        }
+        END {
+          if (matches != 1 || matched_validity ~ /^[erd]$/ ||
+              matched_capabilities !~ /[sS]/ || matched_capabilities ~ /D/) exit 1
+          print matched_type ":" matched_capabilities
+        }
+      '
+  ); then
+    print_error "Configured fingerprint does not identify exactly one usable signing secret key or subkey"
+    return 1
+  fi
+
+  print_info "Using exact secret ${key_record%%:*} signing fingerprint: $SIGNING_FINGERPRINT"
+}
+
+verify_exact_signature() {
+  local artifact="$1"
+  local signature="$2"
+  local status
+
+  status=$(gpg --batch --no-auto-key-retrieve --homedir "$SIGNING_GNUPGHOME" --status-fd 1 \
+    --verify "$signature" "$artifact" 2>/dev/null) || return 1
+  awk -v wanted="$SIGNING_FINGERPRINT" '
+    $1 == "[GNUPG:]" && $2 ~ /^(BADSIG|ERRSIG|EXPSIG|EXPKEYSIG|REVKEYSIG|NO_PUBKEY|KEYEXPIRED|SIGEXPIRED)$/ {
+      rejected++
+    }
+    $1 == "[GNUPG:]" && $2 == "VALIDSIG" {
+      valid++
+      if (toupper($3) == wanted) exact++
+    }
+    END { exit !(rejected == 0 && valid == 1 && exact == 1) }
+  ' <<<"$status"
+}
+
+verify_repository_package_signatures() {
+  local package signature
+  local verified=0
+  local -a packages=()
+
+  shopt -s nullglob
+  packages=("$REPO_DIR"/*.pkg.tar.*)
+  shopt -u nullglob
+  [[ ${#packages[@]} -gt 0 ]] || {
+    print_error "Repository contains no packages to index: $REPO_DIR"
+    return 1
+  }
+
+  for package in "${packages[@]}"; do
+    [[ $package != *.sig ]] || continue
+    signature="$package.sig"
+    [[ -f $package && ! -L $package && -s $package ]] || {
+      print_error "Repository package is missing or unsafe: $package"
+      return 1
+    }
+    [[ -f $signature && ! -L $signature && -s $signature ]] || {
+      print_error "Repository package signature is missing or unsafe: $signature"
+      return 1
+    }
+    if ! verify_exact_signature "$package" "$signature"; then
+      print_error "Package signature is invalid or not from $SIGNING_FINGERPRINT: ${package##*/}"
+      return 1
+    fi
+    verified=$((verified + 1))
+  done
+  [[ $verified -gt 0 ]] || {
+    print_error "Repository contains no packages to index: $REPO_DIR"
+    return 1
+  }
+}
+
+sign_staged_artifact() {
+  local artifact="$1"
+  local signature="$artifact.sig"
+  local signature_tmp
+
+  [[ -s $artifact && ! -L $artifact ]] || {
+    print_error "Cannot sign missing or unsafe staged artifact: $artifact"
+    return 1
+  }
+  signature_tmp=$(mktemp "${signature}.XXXXXX")
+  if ! gpg --batch --yes --homedir "$SIGNING_GNUPGHOME" --pinentry-mode loopback \
+    --passphrase-file "$SIGNING_PASSPHRASE_FILE" --detach-sign --no-armor \
+    --local-user "$SIGNING_FINGERPRINT!" --output "$signature_tmp" "$artifact" 2>/dev/null; then
+    rm -f -- "$signature_tmp"
+    print_error "Failed to sign staged repository artifact: ${artifact##*/}"
+    return 1
+  fi
+  if ! verify_exact_signature "$artifact" "$signature_tmp"; then
+    rm -f -- "$signature_tmp"
+    print_error "Generated repository signature failed exact-fingerprint verification: ${artifact##*/}"
+    return 1
+  fi
+  chmod 0644 "$signature_tmp"
+  mv -f -- "$signature_tmp" "$signature"
+}
+
+verify_database_generation() {
+  local generation_dir="$1"
+  local alias target
+
+  [[ -d $generation_dir && ! -L $generation_dir ]] || return 1
+  for artifact in omarchy.db.tar.zst omarchy.files.tar.zst; do
+    [[ -s $generation_dir/$artifact && ! -L $generation_dir/$artifact ]] || return 1
+    [[ -s $generation_dir/$artifact.sig && ! -L $generation_dir/$artifact.sig ]] || return 1
+    verify_exact_signature "$generation_dir/$artifact" "$generation_dir/$artifact.sig" || return 1
+  done
+  for alias in omarchy.db omarchy.files; do
+    target="$alias.tar.zst"
+    [[ -L $generation_dir/$alias && $(readlink "$generation_dir/$alias") == "$target" ]] || return 1
+    [[ -L $generation_dir/$alias.sig && $(readlink "$generation_dir/$alias.sig") == "$target.sig" ]] || return 1
+  done
+}
+
+complete_staged_generation() {
+  sign_staged_artifact "$DB_STAGE_DIR/omarchy.db.tar.zst"
+  sign_staged_artifact "$DB_STAGE_DIR/omarchy.files.tar.zst"
+  rm -f -- "$DB_STAGE_DIR/omarchy.db.sig" "$DB_STAGE_DIR/omarchy.files.sig"
+  ln -s omarchy.db.tar.zst.sig "$DB_STAGE_DIR/omarchy.db.sig"
+  ln -s omarchy.files.tar.zst.sig "$DB_STAGE_DIR/omarchy.files.sig"
+  verify_database_generation "$DB_STAGE_DIR" || {
+    print_error "Staged repository generation is incomplete or has invalid signatures"
+    return 1
+  }
+}
+
+activate_generation() {
+  local generation="$1"
+  local generation_dir activation_tmp name
+  local -a activation_order=(
+    omarchy.files.tar.zst.sig omarchy.files.sig
+    omarchy.files.tar.zst omarchy.files
+    omarchy.db.tar.zst.sig omarchy.db.sig
+    omarchy.db.tar.zst omarchy.db
+  )
+
+  [[ $generation =~ ^generation-[A-Za-z0-9._-]+$ ]] || {
+    print_error "Unsafe repository database generation name: $generation"
+    return 1
+  }
+  generation_dir="$REPO_DIR/.omarchy-db-generations/$generation"
+  verify_database_generation "$generation_dir" || {
+    print_error "Repository database generation cannot be activated: $generation"
+    return 1
+  }
+  for name in "${activation_order[@]}"; do
+    if [[ -d $REPO_DIR/$name && ! -L $REPO_DIR/$name ]]; then
+      print_error "Canonical repository database path is an unsafe directory: $REPO_DIR/$name"
+      return 1
+    fi
+  done
+
+  activation_tmp=$(mktemp -d "$REPO_DIR/.omarchy-db-activate.XXXXXX")
+  for name in "${activation_order[@]}"; do
+    ln -s ".omarchy-db-generations/$generation/$name" "$activation_tmp/$name"
+  done
+  for name in "${activation_order[@]}"; do
+    if ! mv -f -- "$activation_tmp/$name" "$REPO_DIR/$name"; then
+      rm -rf -- "$activation_tmp"
+      print_error "Could not activate canonical repository database path: $name"
+      return 1
+    fi
+  done
+  rmdir "$activation_tmp"
+}
+
+transaction_marker_path() {
+  printf '%s/.omarchy-db-transaction\n' "$REPO_DIR"
+}
+
+write_transaction_marker() {
+  local generation="$1"
+  local marker marker_tmp
+
+  marker=$(transaction_marker_path)
+  [[ ! -L $marker ]] || {
+    print_error "Repository transaction marker must not be a symlink"
+    return 1
+  }
+  marker_tmp=$(mktemp "$REPO_DIR/.omarchy-db-transaction.XXXXXX")
+  printf '%s\n' "$generation" >"$marker_tmp"
+  chmod 0644 "$marker_tmp"
+  mv -f -- "$marker_tmp" "$marker"
+}
+
+recover_pending_transaction() {
+  local marker generation line_count
+
+  marker=$(transaction_marker_path)
+  [[ -e $marker || -L $marker ]] || return 0
+  [[ -f $marker && ! -L $marker ]] || {
+    print_error "Repository transaction marker is malformed or unsafe"
+    return 1
+  }
+  IFS= read -r generation <"$marker" || {
+    print_error "Repository transaction marker is empty"
+    return 1
+  }
+  line_count=$(wc -l <"$marker")
+  [[ $line_count -eq 1 && $generation =~ ^generation-[A-Za-z0-9._-]+$ ]] || {
+    print_error "Repository transaction marker contains an unsafe generation"
+    return 1
+  }
+
+  print_warning "Completing interrupted repository database activation: $generation"
+  activate_generation "$generation"
+  rm -f -- "$marker"
+  print_success "Interrupted repository database activation recovered"
+}
+
+publish_staged_generation() {
+  local generation generation_root generation_dir marker
+
+  generation="generation-$(date -u +%Y%m%dT%H%M%SZ)-$$-$RANDOM"
+  generation_root="$REPO_DIR/.omarchy-db-generations"
+  generation_dir="$generation_root/$generation"
+  mkdir -p -m 0755 "$generation_root"
+  [[ ! -e $generation_dir && ! -L $generation_dir ]] || {
+    print_error "Repository database generation already exists: $generation"
+    return 1
+  }
+  mv -- "$DB_STAGE_DIR" "$generation_dir"
+  DB_STAGE_DIR=""
+  chmod 0755 "$generation_dir"
+  chmod 0644 \
+    "$generation_dir/omarchy.db.tar.zst" "$generation_dir/omarchy.db.tar.zst.sig" \
+    "$generation_dir/omarchy.files.tar.zst" "$generation_dir/omarchy.files.tar.zst.sig"
+  verify_database_generation "$generation_dir" || {
+    print_error "Signed repository generation failed verification after staging"
+    return 1
+  }
+
+  write_transaction_marker "$generation"
+  marker=$(transaction_marker_path)
+  activate_generation "$generation"
+  rm -f -- "$marker"
+}
+
+update_database() {
+  print_info "Building repository database in an isolated staging directory..."
+  check_docker
+
+  # repo-add is architecture- and mirror-independent, so always use the edge
+  # x86_64 image. The repository itself is mounted read-only; only the fresh
+  # staging directory is writable by the caller's numeric uid/gid.
+  build_docker_image "$BUILD_DIR" x86_64 edge
+  DB_STAGE_DIR=$(mktemp -d "$REPO_DIR/.omarchy-db-stage.XXXXXX")
+  docker run --rm --platform linux/amd64 \
+    --user "$(id -u):$(id -g)" \
+    -e ARCH="$ARCH" \
+    -e MIRROR="$MIRROR" \
+    -e REPOSITORY_DIR=/repository \
+    -e STAGING_DIR=/staging \
+    -v "$REPO_DIR:/repository:ro" \
+    -v "$DB_STAGE_DIR:/staging" \
+    -v "$BUILD_DIR:/build:ro" \
+    omarchy-pkg-builder:latest-x86_64-edge /build/update-repo.sh
+
+  complete_staged_generation
+  publish_staged_generation
+}
+
 main() {
   print_header "Omarchy Repository Database Manager"
 
-  # Parse command line arguments
   while [[ $# -gt 0 ]]; do
     case $1 in
     --arch)
-      ARCH="$2"
+      require_value "$@"
+      ARCH=$2
+      case "$ARCH" in x86_64|aarch64) ;; *) print_error "Invalid architecture: $ARCH"; exit 1 ;; esac
       update_arch_paths
       shift 2
       ;;
     --mirror)
-      MIRROR="$2"
+      require_value "$@"
+      MIRROR=$2
       require_valid_mirror "$MIRROR"
       update_arch_paths
       shift 2
       ;;
-    -h | --help)
+    -h|--help)
       echo "Usage: $0 [OPTIONS]"
       echo ""
       echo "Options:"
@@ -75,17 +384,30 @@ main() {
     esac
   done
 
+  case "$ARCH" in x86_64|aarch64) ;; *) print_error "Invalid architecture: $ARCH"; exit 1 ;; esac
+  require_valid_mirror "$MIRROR"
+  update_arch_paths
+
   print_info "Target architecture: $ARCH"
   print_info "Mirror: $MIRROR"
   print_info "Output directory: $REPO_DIR"
 
-  acquire_release_lock || exit 1
+  [[ -d $REPO_DIR && ! -L $REPO_DIR ]] || {
+    print_error "Output directory not found or unsafe: $REPO_DIR"
+    print_warning "Run bin/repo build first"
+    exit 1
+  }
 
+  # Validate and isolate credentials before Docker, network access, locking, or
+  # any mutation of the published repository tree.
+  prepare_signing_keyring
+  acquire_release_lock || exit 1
+  recover_pending_transaction
+  verify_repository_package_signatures
   update_database
 
   echo ""
-  print_success "Repository update complete!"
+  print_success "Signed repository database update complete!"
 }
 
-# Run main function
 main "$@"

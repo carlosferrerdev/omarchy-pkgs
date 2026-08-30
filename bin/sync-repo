@@ -1,15 +1,219 @@
 #!/bin/bash
 
+unset GPG_PRIVATE_KEY GPG_PASSPHRASE
+
 # Source common functions
 BUILD_ROOT=$(realpath "${BASH_SOURCE[0]%/*}/..")
 source "$BUILD_ROOT/helpers/message-helpers.sh"
 source "$BUILD_ROOT/helpers/paths.sh"
 source "$BUILD_ROOT/helpers/lock-helpers.sh"
 source "$BUILD_ROOT/helpers/publish-helpers.sh"
+source "$BUILD_ROOT/helpers/repository-signature-helpers.sh"
 
 REMOTE=""
 SKIP_PROD_CHECK=false
 PRUNE=false
+VERIFY_GNUPGHOME=""
+SIGNING_FINGERPRINT=""
+TRUST_FINGERPRINT=""
+REMOTE_DB_FILE=""
+REMOTE_DB_SIGNATURE_FILE=""
+LOCAL_INVENTORY_FILE=""
+DATABASE_INVENTORY_FILE=""
+
+cleanup() {
+  if [[ -n "$VERIFY_GNUPGHOME" && -d "$VERIFY_GNUPGHOME" ]]; then
+    gpgconf --homedir "$VERIFY_GNUPGHOME" --kill gpg-agent >/dev/null 2>&1 || true
+    rm -rf -- "$VERIFY_GNUPGHOME"
+  fi
+  [[ -z "$REMOTE_DB_FILE" ]] || rm -f -- "$REMOTE_DB_FILE"
+  [[ -z "$REMOTE_DB_SIGNATURE_FILE" ]] || rm -f -- "$REMOTE_DB_SIGNATURE_FILE"
+  [[ -z "$LOCAL_INVENTORY_FILE" ]] || rm -f -- "$LOCAL_INVENTORY_FILE"
+  [[ -z "$DATABASE_INVENTORY_FILE" ]] || rm -f -- "$DATABASE_INVENTORY_FILE"
+}
+trap cleanup EXIT
+
+verify_exact_database_signature() {
+  local artifact="$1"
+  local signature="$2"
+  local artifact_real signature_real
+
+  artifact_real=$(realpath "$artifact") || return 1
+  signature_real=$(realpath "$signature") || return 1
+  repository_signature_verify_exact "$VERIFY_GNUPGHOME" "$SIGNING_FINGERPRINT" \
+    "$artifact_real" "$signature_real"
+}
+
+prepare_database_verification_keyring() {
+  local public_key_file="${OMARCHY_PKGS_SIGNING_PUBLIC_KEY_FILE:-}"
+
+  TRUST_FINGERPRINT=$(repository_signature_normalize_fingerprint \
+    OMARCHY_PKGS_TRUST_KEY_FINGERPRINT \
+    "${OMARCHY_PKGS_TRUST_KEY_FINGERPRINT:-}") || return 1
+  SIGNING_FINGERPRINT=$(repository_signature_normalize_fingerprint \
+    OMARCHY_PKGS_SIGNING_KEY_FINGERPRINT \
+    "${OMARCHY_PKGS_SIGNING_KEY_FINGERPRINT:-}") || return 1
+
+  VERIFY_GNUPGHOME=$(mktemp -d)
+  chmod 0700 "$VERIFY_GNUPGHOME"
+  repository_signature_prepare_keyring "$VERIFY_GNUPGHOME" "$public_key_file" \
+    "$TRUST_FINGERPRINT" "$SIGNING_FINGERPRINT"
+}
+
+validate_local_database_set() {
+  local repo_real name resolved
+  local -a canonical_names=(
+    omarchy.db omarchy.db.tar.zst omarchy.files omarchy.files.tar.zst
+    omarchy.db.sig omarchy.db.tar.zst.sig omarchy.files.sig omarchy.files.tar.zst.sig
+  )
+
+  repo_real=$(realpath "$REPO_DIR")
+  for name in "${canonical_names[@]}"; do
+    [[ -L $REPO_DIR/$name && -s $REPO_DIR/$name ]] || {
+      print_error "Signed repository database set is missing or unsafe: $REPO_DIR/$name"
+      return 1
+    }
+    resolved=$(realpath "$REPO_DIR/$name") || return 1
+    case "$resolved" in
+      "$repo_real"/.omarchy-db-generations/*) ;;
+      *)
+        print_error "Canonical repository database path escapes its immutable generation: $name"
+        return 1
+        ;;
+    esac
+  done
+  [[ $(realpath "$REPO_DIR/omarchy.db") == $(realpath "$REPO_DIR/omarchy.db.tar.zst") ]] || return 1
+  [[ $(realpath "$REPO_DIR/omarchy.db.sig") == $(realpath "$REPO_DIR/omarchy.db.tar.zst.sig") ]] || return 1
+  [[ $(realpath "$REPO_DIR/omarchy.files") == $(realpath "$REPO_DIR/omarchy.files.tar.zst") ]] || return 1
+  [[ $(realpath "$REPO_DIR/omarchy.files.sig") == $(realpath "$REPO_DIR/omarchy.files.tar.zst.sig") ]] || return 1
+
+  verify_exact_database_signature "$REPO_DIR/omarchy.db" "$REPO_DIR/omarchy.db.sig" || {
+    print_error "omarchy.db signature is invalid or does not match $SIGNING_FINGERPRINT"
+    return 1
+  }
+  verify_exact_database_signature "$REPO_DIR/omarchy.db.tar.zst" "$REPO_DIR/omarchy.db.tar.zst.sig" || return 1
+  verify_exact_database_signature "$REPO_DIR/omarchy.files" "$REPO_DIR/omarchy.files.sig" || return 1
+  verify_exact_database_signature "$REPO_DIR/omarchy.files.tar.zst" "$REPO_DIR/omarchy.files.tar.zst.sig" || return 1
+}
+
+validate_local_package_set() {
+  local package signature package_count=0
+
+  shopt -s nullglob
+  for package in "$REPO_DIR"/*.pkg.tar.*; do
+    [[ $package == *.sig ]] && continue
+    package_count=$((package_count + 1))
+    signature="$package.sig"
+    if [[ ! -f $package || -L $package || ! -f $signature || -L $signature ]]; then
+      print_error "Repository package or signature is missing, non-regular, or a symlink: ${package##*/}"
+      shopt -u nullglob
+      return 1
+    fi
+    if ! verify_exact_database_signature "$package" "$signature"; then
+      print_error "Repository package signature is invalid or has an unexpected signer: ${package##*/}"
+      shopt -u nullglob
+      return 1
+    fi
+  done
+  for signature in "$REPO_DIR"/*.pkg.tar.*.sig; do
+    [[ -e $signature || -L $signature ]] || continue
+    package=${signature%.sig}
+    if [[ ! -f $package || -L $package ]]; then
+      print_error "Orphan or unsafe package signature: ${signature##*/}"
+      shopt -u nullglob
+      return 1
+    fi
+  done
+  shopt -u nullglob
+
+  if [[ $package_count -eq 0 ]]; then
+    print_error "Repository contains no regular package artifacts"
+    return 1
+  fi
+}
+
+validate_local_database_inventory() {
+  local package package_metadata package_name package_version database_records
+  local database_inventory local_names database_names missing_records duplicate_count
+
+  command -v bsdtar >/dev/null 2>&1 || {
+    print_error "bsdtar is required to validate repository database inventory"
+    return 1
+  }
+
+  LOCAL_INVENTORY_FILE=$(mktemp)
+  DATABASE_INVENTORY_FILE=$(mktemp)
+  shopt -s nullglob
+  for package in "$REPO_DIR"/*.pkg.tar.*; do
+    [[ $package != *.sig ]] || continue
+    if ! package_metadata=$(bsdtar -xOqf "$package" .PKGINFO 2>/dev/null | awk '
+      /^pkgname = / { name = substr($0, 11) }
+      /^pkgver = / { version = substr($0, 10) }
+      END {
+        if (name == "" || version == "") exit 1
+        print name "\t" version
+      }
+    '); then
+      print_error "Repository package metadata is unreadable: ${package##*/}"
+      shopt -u nullglob
+      return 1
+    fi
+    IFS=$'\t' read -r package_name package_version <<<"$package_metadata"
+    printf '%s\t%s\t%s\n' "$package_name" "$package_version" "${package##*/}" \
+      >>"$LOCAL_INVENTORY_FILE"
+  done
+  shopt -u nullglob
+  sort -u -o "$LOCAL_INVENTORY_FILE" "$LOCAL_INVENTORY_FILE"
+
+  if ! database_records=$(bsdtar -xOf "$REPO_DIR/omarchy.db" --include '*/desc' 2>/dev/null); then
+    print_error "Signed repository database inventory could not be read"
+    return 1
+  fi
+  if ! database_inventory=$(printf '%s\n' "$database_records" | awk '
+    function emit() {
+      if (name == "" && version == "" && filename == "") return
+      if (name == "" || version == "" || filename == "") invalid = 1
+      else print name "\t" version "\t" filename
+      name = version = filename = ""
+    }
+    $0 == "%NAME%" { getline; name = $0; next }
+    $0 == "%VERSION%" { getline; version = $0; next }
+    $0 == "%FILENAME%" { emit(); getline; filename = $0; next }
+    END { emit(); exit invalid }
+  '); then
+    print_error "Signed repository database contains an incomplete inventory record"
+    return 1
+  fi
+  printf '%s\n' "$database_inventory" | sort >"$DATABASE_INVENTORY_FILE"
+  [[ -s $DATABASE_INVENTORY_FILE ]] || {
+    print_error "Signed repository database contains no package inventory"
+    return 1
+  }
+
+  duplicate_count=$(cut -f1 "$DATABASE_INVENTORY_FILE" | uniq -d | wc -l | tr -d '[:space:]')
+  if [[ $duplicate_count -ne 0 ]]; then
+    print_error "Signed repository database contains duplicate package names"
+    return 1
+  fi
+
+  missing_records=$(comm -23 "$DATABASE_INVENTORY_FILE" "$LOCAL_INVENTORY_FILE")
+  if [[ -n $missing_records ]]; then
+    print_error "Signed repository database names a package version or file absent locally"
+    printf '%s\n' "$missing_records" | sed 's/^/  /'
+    return 1
+  fi
+
+  local_names=$(cut -f1 "$LOCAL_INVENTORY_FILE" | sort -u)
+  database_names=$(cut -f1 "$DATABASE_INVENTORY_FILE" | sort -u)
+  if [[ $local_names != "$database_names" ]]; then
+    print_error "Signed repository database does not match the complete local package inventory"
+    print_info "Package names missing from the database:"
+    comm -23 <(printf '%s\n' "$local_names") <(printf '%s\n' "$database_names") | sed 's/^/  /'
+    print_info "Package names present only in the database:"
+    comm -13 <(printf '%s\n' "$local_names") <(printf '%s\n' "$database_names") | sed 's/^/  /'
+    return 1
+  fi
+}
 
 # Print header
 print_header "Sync Repository to Remote"
@@ -88,6 +292,14 @@ if [[ ! -d "$REPO_DIR" ]]; then
   exit 1
 fi
 
+# A manually invoked sync must not publish a legacy unsigned or partially
+# signed database. Validate the complete immutable local generation before the
+# first rclone call or any package upload.
+prepare_database_verification_keyring || exit 1
+validate_local_database_set || exit 1
+validate_local_package_set || exit 1
+validate_local_database_inventory || exit 1
+
 DESTINATION_DIRECTORY="$MIRROR/$ARCH"
 
 # Publishing always deserves confirmation unless the caller explicitly owns
@@ -100,6 +312,12 @@ if [[ "$SKIP_PROD_CHECK" != true ]]; then
 fi
 
 acquire_release_lock || exit 1
+# The generation may have changed while an operator answered the confirmation
+# prompt or while this process waited for the lock. Revalidate under the lock;
+# every managed repository mutation uses the same lock.
+validate_local_database_set || exit 1
+validate_local_package_set || exit 1
+validate_local_database_inventory || exit 1
 
 print_info "Syncing to: $REMOTE/$DESTINATION_DIRECTORY"
 
@@ -138,11 +356,33 @@ elif [[ $RCLONE_STATUS -ne 0 ]]; then
 fi
 
 if grep -qx 'omarchy\.db' <<<"$REMOTE_LISTING"; then
+  if ! grep -qx 'omarchy\.db\.sig' <<<"$REMOTE_LISTING"; then
+    print_error "The remote database exists without its detached signature"
+    echo ""
+    echo "Refusing to trust an unsigned remote package inventory."
+    exit 1
+  fi
+
   # bsdtar, not tar: the database is compressed and GNU tar will not detect that
   # on a pipe. repo-add has used both gzip and zstd, so let libarchive decide.
   REMOTE_DB_FILE=$(mktemp)
-  trap 'rm -f "$REMOTE_DB_FILE"' EXIT
-  rclone cat "$REMOTE/$DESTINATION_DIRECTORY/omarchy.db" --s3-no-head >"$REMOTE_DB_FILE" 2>/dev/null
+  REMOTE_DB_SIGNATURE_FILE=$(mktemp)
+  if ! rclone cat "$REMOTE/$DESTINATION_DIRECTORY/omarchy.db" --s3-no-head \
+    >"$REMOTE_DB_FILE" 2>/dev/null; then
+    print_error "Could not download the remote repository database"
+    exit 1
+  fi
+  if ! rclone cat "$REMOTE/$DESTINATION_DIRECTORY/omarchy.db.sig" --s3-no-head \
+    >"$REMOTE_DB_SIGNATURE_FILE" 2>/dev/null; then
+    print_error "Could not download the remote repository database signature"
+    exit 1
+  fi
+  if ! verify_exact_database_signature "$REMOTE_DB_FILE" "$REMOTE_DB_SIGNATURE_FILE"; then
+    print_error "The remote database signature is invalid or has an unexpected signer"
+    echo ""
+    echo "Refusing to derive publication policy from unauthenticated remote state."
+    exit 1
+  fi
 
   if ! command -v bsdtar >/dev/null 2>&1; then
     print_error "bsdtar is not installed"
@@ -195,8 +435,8 @@ fi
 # exist on the remote. Packages built on another machine live only in that
 # machine's build-output, and pkgs.omarchy.org/ is gitignored, so any checkout
 # that has not run a full release is missing nearly everything. `sync` would read
-# those absences as deletions and empty the repository. --ignore-existing keeps
-# versions already published from being overwritten.
+# those absences as deletions and empty the repository. Checksums preserve equal
+# objects but repair a corrupted or divergent remote package/signature.
 if [[ "$PRUNE" == true ]]; then
   print_warning "Pruning: remote packages missing from $REPO_DIR will be DELETED"
   if [[ "$SKIP_PROD_CHECK" != true ]]; then
@@ -210,10 +450,10 @@ if [[ "$PRUNE" == true ]]; then
   print_info "Syncing packages (with prune)..."
   if ! rclone sync "$REPO_DIR" "$REMOTE/$DESTINATION_DIRECTORY" \
     --s3-no-head \
-    --exclude "omarchy.db*" \
-    --exclude "omarchy.files*" \
-    --ignore-existing \
-    --copy-links --delete-after -v; then
+    --include "/*.pkg.tar.*" \
+    --exclude "*" \
+    --checksum \
+    --delete-after -v; then
     print_error "Package sync failed — not publishing the database"
     exit 1
   fi
@@ -221,10 +461,10 @@ else
   print_info "Syncing packages..."
   if ! rclone copy "$REPO_DIR" "$REMOTE/$DESTINATION_DIRECTORY" \
     --s3-no-head \
-    --exclude "omarchy.db*" \
-    --exclude "omarchy.files*" \
-    --ignore-existing \
-    --copy-links -v; then
+    --include "/*.pkg.tar.*" \
+    --exclude "*" \
+    --checksum \
+    -v; then
     print_error "Package upload failed — not publishing the database"
     print_warning "The remote database still describes the previous contents, so"
     print_warning "the repository is unchanged and consistent."
@@ -232,16 +472,27 @@ else
   fi
 fi
 
-# Then sync database files last to ensure repository integrity
+# Publish signatures before their corresponding artifacts. If any copy fails,
+# clients may temporarily reject the mismatched generation, but DatabaseRequired
+# ensures they can never accept an unsigned or incorrectly signed database.
+# omarchy.db is the pacman entry point and is committed last.
 print_info "Updating repository database..."
-if ! rclone copy "$REPO_DIR" "$REMOTE/$DESTINATION_DIRECTORY" \
-  --s3-no-head \
-  --include "omarchy.*" \
-  --checksum --copy-links -v; then
-  print_error "Database upload failed"
-  print_warning "Packages were uploaded but the database still describes the"
-  print_warning "previous contents. Re-run sync to finish publishing them."
-  exit 1
-fi
+DATABASE_UPLOAD_ORDER=(
+  omarchy.files.tar.zst.sig omarchy.files.sig
+  omarchy.files.tar.zst omarchy.files
+  omarchy.db.tar.zst.sig omarchy.db.sig
+  omarchy.db.tar.zst omarchy.db
+)
+for database_artifact in "${DATABASE_UPLOAD_ORDER[@]}"; do
+  database_source=$(realpath "$REPO_DIR/$database_artifact") || exit 1
+  if ! rclone copyto "$database_source" \
+    "$REMOTE/$DESTINATION_DIRECTORY/$database_artifact" \
+    --s3-no-head --checksum -v; then
+    print_error "Database upload failed at $database_artifact"
+    print_warning "The remote may reject the in-progress signed generation."
+    print_warning "Re-run sync to complete publication; omarchy.db is always last."
+    exit 1
+  fi
+done
 
 print_success "Sync complete!"

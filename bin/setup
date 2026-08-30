@@ -4,7 +4,8 @@
 # The host receives uploads, promotes packages into the published tree, and
 # syncs that tree to the mirror. Everything Arch-specific — makepkg, repo-add,
 # package signing — happens inside containers, so the host itself needs very
-# little and does not need to be Arch. The production host is Ubuntu.
+# little and does not need to be Arch. Signing uses host GnuPG with isolated
+# temporary keyrings; the production host is Ubuntu.
 #
 # Run this on the host itself:
 #   ssh root@<host> 'cd /root/omarchy-pkgs && bin/setup'
@@ -16,6 +17,7 @@ set -e
 BUILD_ROOT=$(realpath "${BASH_SOURCE[0]%/*}/..")
 source "$BUILD_ROOT/helpers/message-helpers.sh"
 source "$BUILD_ROOT/helpers/publish-helpers.sh"
+source "$BUILD_ROOT/helpers/signing-secret-helpers.sh"
 
 CHECK_ONLY=false
 SKIP_TIMERS=false
@@ -103,11 +105,13 @@ install_packages() {
 
 # --- dependencies ------------------------------------------------------------
 
-# Only what the host runs directly. Signing and repo-add happen in containers,
-# so gnupg and the Arch build tools are deliberately absent from this list.
+# Only what the host runs directly. Package builds and repo-add remain in the
+# Arch container; signing and signature verification deliberately use the
+# host's isolated GnuPG homes.
 REQUIREMENTS=(
   "bsdtar:$PKG_BSDTAR" # reads repo databases and .PKGINFO out of packages
   "git:git"            # pulls this repository
+  "gpg:gnupg"          # signs and verifies packages and repository databases
   "jq:jq"              # package metadata in .omarchy/package.json
   "rsync:rsync"        # receives uploads from bin/repo push
   "rclone:rclone"      # publishes to the mirror
@@ -271,8 +275,23 @@ credentials_loaded=false
 credentials_valid=false
 if [[ -f "$CREDENTIALS" ]] && source "$CREDENTIALS"; then
   credentials_loaded=true
-  if credentials_file_exports "$CREDENTIALS" \
-    GPG_PRIVATE_KEY GPG_PASSPHRASE OMARCHY_PKGS_RCLONE_DEST; then
+  legacy_inline_credentials=false
+  if [[ -n ${GPG_PRIVATE_KEY:-} || -n ${GPG_PASSPHRASE:-} ]]; then
+    legacy_inline_credentials=true
+    print_warning "$CREDENTIALS still contains retired inline GPG secrets"
+    print_warning "Move them to owner-only files and remove the inline variables"
+  fi
+  unset GPG_PRIVATE_KEY GPG_PASSPHRASE
+  if [[ $legacy_inline_credentials == false ]] &&
+    credentials_file_exports "$CREDENTIALS" \
+    OMARCHY_PKGS_SIGNING_PRIVATE_KEY_FILE \
+    OMARCHY_PKGS_SIGNING_PASSPHRASE_FILE \
+    OMARCHY_PKGS_DB_BASE \
+    OMARCHY_PKGS_TRUST_KEY_FINGERPRINT \
+    OMARCHY_PKGS_SIGNING_KEY_FINGERPRINT \
+    OMARCHY_PKGS_SIGNING_PUBLIC_KEY_FILE \
+    OMARCHY_PKGS_RCLONE_DEST &&
+    validate_signing_secret_pair; then
     credentials_valid=true
     print_success "exported release credentials present: $CREDENTIALS"
   else
@@ -282,8 +301,11 @@ if [[ -f "$CREDENTIALS" ]] && source "$CREDENTIALS"; then
 else
   print_warning "Missing or unreadable $CREDENTIALS"
 fi
-echo "    It must export GPG_PRIVATE_KEY, GPG_PASSPHRASE, and"
-echo "    OMARCHY_PKGS_RCLONE_DEST; release services source it before publishing."
+echo "    It must export OMARCHY_PKGS_SIGNING_PRIVATE_KEY_FILE,"
+echo "    OMARCHY_PKGS_SIGNING_PASSPHRASE_FILE, OMARCHY_PKGS_DB_BASE,"
+echo "    OMARCHY_PKGS_TRUST_KEY_FINGERPRINT, OMARCHY_PKGS_SIGNING_KEY_FINGERPRINT,"
+echo "    OMARCHY_PKGS_SIGNING_PUBLIC_KEY_FILE, and OMARCHY_PKGS_RCLONE_DEST;"
+echo "    release services source it before publishing."
 
 # Release reporting is optional, but silence is indistinguishable from a
 # broken hook, so say which chat (if any) will receive build reports.

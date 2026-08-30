@@ -16,11 +16,15 @@
 
 set -e
 
+unset GPG_PRIVATE_KEY GPG_PASSPHRASE
+
 BUILD_ROOT=$(realpath "${BASH_SOURCE[0]%/*}/..")
 source "$BUILD_ROOT/helpers/message-helpers.sh"
 source "$BUILD_ROOT/helpers/paths.sh"
 source "$BUILD_ROOT/helpers/host-helpers.sh"
 source "$BUILD_ROOT/helpers/publish-helpers.sh"
+source "$BUILD_ROOT/helpers/trust-helpers.sh"
+source "$BUILD_ROOT/helpers/repository-signature-helpers.sh"
 
 UPSTREAM_URL="${OMARCHY_UPSTREAM_URL:-https://github.com/carlosferrerdev/prumo.git}"
 UPSTREAM_REPO="${OMARCHY_UPSTREAM_REPO:-carlosferrerdev/prumo}"
@@ -53,10 +57,24 @@ require_release_config() {
   [[ -n "$ISO_REPO" ]] || missing+=(OMARCHY_ISO_REPO)
   [[ -n "$ISO_RCLONE_DEST" ]] || missing+=(OMARCHY_ISO_RCLONE_DEST)
   [[ -n "$PKGS_RCLONE_DEST" ]] || missing+=(OMARCHY_PKGS_RCLONE_DEST)
+  [[ -n ${OMARCHY_PKGS_TRUST_KEY_FINGERPRINT:-} ]] || missing+=(OMARCHY_PKGS_TRUST_KEY_FINGERPRINT)
+  [[ -n ${OMARCHY_PKGS_SIGNING_KEY_FINGERPRINT:-} ]] || missing+=(OMARCHY_PKGS_SIGNING_KEY_FINGERPRINT)
+  [[ -n ${OMARCHY_PKGS_SIGNING_PUBLIC_KEY_FILE:-} ]] || missing+=(OMARCHY_PKGS_SIGNING_PUBLIC_KEY_FILE)
   if (( ${#missing[@]} > 0 )); then
     print_error "Gomarchy release infrastructure is not fully configured"
     print_error "Set: ${missing[*]}"
     print_error "Refusing to inherit any Omarchy production destination"
+    exit 1
+  fi
+  repository_signature_normalize_fingerprint OMARCHY_PKGS_TRUST_KEY_FINGERPRINT \
+    "$OMARCHY_PKGS_TRUST_KEY_FINGERPRINT" >/dev/null || exit 1
+  repository_signature_normalize_fingerprint OMARCHY_PKGS_SIGNING_KEY_FINGERPRINT \
+    "$OMARCHY_PKGS_SIGNING_KEY_FINGERPRINT" >/dev/null || exit 1
+  if [[ $OMARCHY_PKGS_SIGNING_PUBLIC_KEY_FILE != /* ||
+    ! -f $OMARCHY_PKGS_SIGNING_PUBLIC_KEY_FILE ||
+    -L $OMARCHY_PKGS_SIGNING_PUBLIC_KEY_FILE ||
+    ! -r $OMARCHY_PKGS_SIGNING_PUBLIC_KEY_FILE ]]; then
+    print_error "OMARCHY_PKGS_SIGNING_PUBLIC_KEY_FILE must name an absolute readable regular non-symlink file"
     exit 1
   fi
   package_publish_destination "$PKGS_RCLONE_DEST" >/dev/null || exit 1
@@ -295,17 +313,49 @@ published_pair_from_descs() {
 # Returns 2 when the database cannot be read and 3 when the package pair is
 # missing or divergent. Callers must not mistake either state for absence.
 published_version() {
-  local channel="$1" tmp descs
-  tmp=$(mktemp) || return 2
-  if ! curl -sf "$PKGS_DB_BASE/$channel/x86_64/omarchy.db.tar.zst" -o "$tmp"; then
-    rm -f "$tmp"
+  local channel="$1" tmp_dir db signature verify_home descs
+  local trust_fingerprint signing_fingerprint public_key_file
+
+  case "$channel" in edge|rc|stable) ;; *) return 2 ;; esac
+  validate_pkgs_db_base "$PKGS_DB_BASE" >/dev/null || return 2
+  trust_fingerprint=$(repository_signature_normalize_fingerprint \
+    OMARCHY_PKGS_TRUST_KEY_FINGERPRINT \
+    "${OMARCHY_PKGS_TRUST_KEY_FINGERPRINT:-}") || return 2
+  signing_fingerprint=$(repository_signature_normalize_fingerprint \
+    OMARCHY_PKGS_SIGNING_KEY_FINGERPRINT \
+    "${OMARCHY_PKGS_SIGNING_KEY_FINGERPRINT:-}") || return 2
+  public_key_file=${OMARCHY_PKGS_SIGNING_PUBLIC_KEY_FILE:-}
+
+  tmp_dir=$(mktemp -d) || return 2
+  db="$tmp_dir/omarchy.db.tar.zst"
+  signature="$db.sig"
+  verify_home="$tmp_dir/gnupg"
+  mkdir -m 0700 "$verify_home"
+  if ! repository_signature_prepare_keyring "$verify_home" "$public_key_file" \
+    "$trust_fingerprint" "$signing_fingerprint"; then
+    rm -rf -- "$tmp_dir"
     return 2
   fi
-  if ! descs=$(tar -xO --zstd -f "$tmp" --wildcards '*/desc' 2>/dev/null); then
-    rm -f "$tmp"
+  if ! curl -fsSL --max-time 120 \
+    "$PKGS_DB_BASE/$channel/x86_64/omarchy.db.tar.zst" -o "$db"; then
+    rm -rf -- "$tmp_dir"
     return 2
   fi
-  rm -f "$tmp"
+  if ! curl -fsSL --max-time 120 \
+    "$PKGS_DB_BASE/$channel/x86_64/omarchy.db.tar.zst.sig" -o "$signature"; then
+    rm -rf -- "$tmp_dir"
+    return 2
+  fi
+  if ! repository_signature_verify_exact "$verify_home" "$signing_fingerprint" \
+    "$db" "$signature"; then
+    rm -rf -- "$tmp_dir"
+    return 2
+  fi
+  if ! descs=$(tar -xO --zstd -f "$db" --wildcards '*/desc' 2>/dev/null); then
+    rm -rf -- "$tmp_dir"
+    return 2
+  fi
+  rm -rf -- "$tmp_dir"
   published_pair_from_descs <<<"$descs"
 }
 
@@ -1742,6 +1792,13 @@ cmd_doctor() {
 
 cmd_self_test() {
   local failures=0
+  local release_public_key_fixture
+  local OMARCHY_PKGS_TRUST_KEY_FINGERPRINT=1111111111111111111111111111111111111111
+  local OMARCHY_PKGS_SIGNING_KEY_FINGERPRINT=2222222222222222222222222222222222222222
+  local OMARCHY_PKGS_SIGNING_PUBLIC_KEY_FILE
+  release_public_key_fixture=$(mktemp) || exit 1
+  printf 'release trust fixture\n' >"$release_public_key_fixture"
+  OMARCHY_PKGS_SIGNING_PUBLIC_KEY_FILE=$release_public_key_fixture
   expect() { # expect <label> <got> <want>
     if [[ "$2" == "$3" ]]; then
       echo "  ok: $1"
@@ -2143,6 +2200,7 @@ cmd_self_test() {
   validate_release_checkout "$checkout_test_dir" example/project >/dev/null 2>&1 || test_status=$?
   expect "dirty release checkout rejected" "$test_status" "1"
   rm -rf -- "$checkout_test_dir"
+  rm -f -- "$release_public_key_fixture"
   echo ""
   if ((failures == 0)); then
     print_success "Self-test passed"

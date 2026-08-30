@@ -1,0 +1,47 @@
+{
+  "schema": 1,
+  "required_packages": [
+    "apple-bcm-firmware",
+    "apple-t2-audio-config",
+    "linux-t2",
+    "linux-t2-headers",
+    "t2fanrd"
+  ],
+  "redistributable_recipes": [
+    "apple-t2-audio-config",
+    "linux-t2",
+    "linux-t2-headers",
+    "t2fanrd"
+  ],
+  "recipes": {
+    "apple-t2-audio-config": {
+      "upstream": "https://github.com/kekrby/t2-better-audio",
+      "commit": "e46839a28963e2f7d364020518b9dac98236bcae",
+      "license": "MIT",
+      "maintenance": "Stable configuration data; last upstream change 2022-10-13."
+    },
+    "linux-t2": {
+      "upstream": "https://github.com/t2linux/linux-t2-patches",
+      "commit": "c032e3d86fa6ab7562b514d5f91f041518984a32",
+      "packaging_commit": "8e53dff21ce5174998134f75d491572490b79910",
+      "license": "GPL-2.0-only",
+      "maintenance": "Active T2 patch set and Arch recipe; pinned August 2026 revisions."
+    },
+    "linux-t2-headers": {
+      "built_from": "linux-t2",
+      "license": "GPL-2.0-only"
+    },
+    "t2fanrd": {
+      "upstream": "https://github.com/GnomedDev/T2FanRD",
+      "commit": "48baf962697ec3d4d969c74cf601ee8e15b7aeaa",
+      "license": "GPL-3.0-or-later",
+      "maintenance": "Active; pinned upstream change from 2026-04-28."
+    }
+  },
+  "blocked": {
+    "apple-bcm-firmware": {
+      "reason": "The upstream recipe declares the firmware license unknown and downloads proprietary firmware blobs from a legacy third-party mirror without integrity hashes.",
+      "resolution": "Require user-supplied firmware extracted from an owned macOS installation, or obtain explicit redistribution terms and an immutable checksummed source."
+    }
+  }
+}

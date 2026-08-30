@@ -4,6 +4,10 @@
 
 set -e
 
+# Refuse to propagate the retired inline-secret contract into git, ssh, Docker,
+# rclone, or any other child. Signing accepts only locked-down file paths.
+unset GPG_PRIVATE_KEY GPG_PASSPHRASE
+
 # Get the directory of this script
 SCRIPT_DIR=$(realpath "${BASH_SOURCE[0]%/*}")
 BUILD_ROOT=$(realpath "$SCRIPT_DIR/..")
@@ -53,7 +57,7 @@ maybe_forward_to_host() {
   [[ -t 0 && -t 1 ]] && tty_flag="-t"
 
   print_info "Repository host configured — running on $host (pass --local to run here)"
-  exec ssh $tty_flag "$host" "source /root/.omarchy/build-credentials 2>/dev/null; cd /root/omarchy-pkgs && git pull --ff-only && exec bin/repo $cmd$quoted"
+  exec ssh $tty_flag "$host" "cd /root/omarchy-pkgs && git pull --ff-only && source /root/.omarchy/build-credentials 2>/dev/null && exec bin/repo $cmd$quoted"
 }
 
 maybe_forward_to_host "$@"

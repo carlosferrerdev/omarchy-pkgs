@@ -1,9 +1,10 @@
 #!/bin/bash
 set -e
 
+unset GPG_PRIVATE_KEY GPG_PASSPHRASE
+
 BUILD_ROOT=$(realpath "${BASH_SOURCE[0]%/*}/..")
 source "$BUILD_ROOT/helpers/message-helpers.sh"
-source "$BUILD_ROOT/helpers/docker-helpers.sh"
 source "$BUILD_ROOT/helpers/paths.sh"
 source "$BUILD_ROOT/helpers/lock-helpers.sh"
 
@@ -51,6 +52,10 @@ if [[ -z "$PACKAGE_NAME" ]]; then
   echo "Usage: $0 <package-name> [OPTIONS]"
   exit 1
 fi
+if [[ ! $PACKAGE_NAME =~ ^[A-Za-z0-9@._+:-]+$ ]]; then
+  print_error "Invalid package name: $PACKAGE_NAME"
+  exit 1
+fi
 
 print_info "Target architecture: $ARCH"
 print_info "Mirror: $MIRROR"
@@ -62,14 +67,35 @@ if [[ ! -d "$REPO_DIR" ]]; then
   exit 1
 fi
 
-# Check Docker is available
-check_docker
+command -v bsdtar >/dev/null 2>&1 || {
+  print_error "bsdtar is required to identify repository packages"
+  exit 1
+}
 
-# Find package files to confirm before running Docker
-cd "$REPO_DIR"
-FILES=$(ls ${PACKAGE_NAME}-[0-9]*.pkg.tar.* 2>/dev/null || true)
+MATCHED_FILES=()
+find_package_files() {
+  local candidate identity signature
+  MATCHED_FILES=()
+  shopt -s nullglob
+  for candidate in "$REPO_DIR"/*.pkg.tar.*; do
+    [[ $candidate == *.sig ]] && continue
+    [[ -f $candidate && ! -L $candidate ]] || continue
+    identity=$(bsdtar -xOf "$candidate" .PKGINFO 2>/dev/null |
+      awk -F ' = ' '$1 == "pkgname" { count++; name=$2 } END { if (count == 1) print name }')
+    [[ $identity == "$PACKAGE_NAME" ]] || continue
+    signature="$candidate.sig"
+    [[ -f $signature && ! -L $signature ]] || {
+      print_error "Package has no regular detached signature: ${candidate##*/}"
+      shopt -u nullglob
+      return 1
+    }
+    MATCHED_FILES+=("$candidate" "$signature")
+  done
+  shopt -u nullglob
+}
 
-if [[ -z "$FILES" ]]; then
+find_package_files
+if [[ ${#MATCHED_FILES[@]} -eq 0 ]]; then
   print_error "Package '$PACKAGE_NAME' not found"
   exit 1
 fi
@@ -77,8 +103,8 @@ fi
 # Confirm removal
 echo ""
 echo "Package files to remove:"
-for file in $FILES; do
-  echo "  - $file"
+for file in "${MATCHED_FILES[@]}"; do
+  echo "  - ${file##*/}"
 done
 echo ""
 read -p "Remove package '$PACKAGE_NAME'? (y/N) " -n 1 -r
@@ -88,26 +114,43 @@ if [[ ! $REPLY =~ ^[Yy]$ ]]; then
   exit 0
 fi
 
-# Build/update the Docker image (always use x86_64 for removal - it's architecture independent)
-# repo-remove is mirror-independent — always use the edge x86_64 image
-build_docker_image "$BUILD_DIR" "x86_64" "edge"
-
 acquire_release_lock || exit 1
+find_package_files
+[[ ${#MATCHED_FILES[@]} -gt 0 ]] || {
+  print_error "Package changed or disappeared while acquiring the release lock"
+  exit 1
+}
 
-print_info "Removing package..."
+REMOVAL_STAGE=$(mktemp -d "$REPO_DIR/.omarchy-remove-stage.XXXXXX")
+chmod 0700 "$REMOVAL_STAGE"
+REMOVAL_COMMITTED=false
+restore_staged_files() {
+  [[ $REMOVAL_COMMITTED == false && -d $REMOVAL_STAGE && ! -L $REMOVAL_STAGE ]] || return 0
+  for file in "$REMOVAL_STAGE"/*; do
+    [[ -e $file || -L $file ]] || continue
+    mv -- "$file" "$REPO_DIR/${file##*/}"
+  done
+  rmdir "$REMOVAL_STAGE" 2>/dev/null || true
+}
+trap restore_staged_files EXIT
 
-# Ensure directory is writable by container user
-make_dir_writable "$REPO_DIR"
+print_info "Staging package removal..."
+for file in "${MATCHED_FILES[@]}"; do
+  mv -- "$file" "$REMOVAL_STAGE/${file##*/}"
+done
 
-# Run the removal script in Docker (always use x86_64 image)
-docker run --rm --platform linux/amd64 \
-  -e ARCH="$ARCH" \
-  -e MIRROR="$MIRROR" \
-  -v "$REPO_ROOT:/pkgs.omarchy.org" \
-  -v "$BUILD_DIR:/build:ro" \
-  omarchy-pkg-builder:latest-x86_64-edge /build/remove-package.sh "$PACKAGE_NAME"
+# update-repo builds and signs a fresh immutable database generation. If any
+# step fails, the EXIT trap restores the package/signature pair and the previous
+# canonical generation remains active.
+if ! "$BUILD_ROOT/bin/update-repo" --arch "$ARCH" --mirror "$MIRROR"; then
+  print_error "Signed database update failed; restoring staged package files"
+  exit 1
+fi
 
-RESULT=$?
+REMOVAL_COMMITTED=true
+rm -rf -- "$REMOVAL_STAGE"
+trap - EXIT
+RESULT=0
 
 echo ""
 if [[ $RESULT -eq 0 ]]; then

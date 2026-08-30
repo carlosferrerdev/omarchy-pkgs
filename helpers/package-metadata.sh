@@ -140,6 +140,27 @@ package_has_pkgbuild() {
   [[ -f "$pkgdir/PKGBUILD" ]]
 }
 
+# Package artifact names a pkgbase is allowed to emit. Most recipes produce a
+# package matching their directory; split packages must declare every output in
+# metadata so a compromised upstream build cannot smuggle an unrelated package
+# into the signing workspace.
+package_expected_outputs() {
+  local pkgdir="$1" metadata default_name
+  metadata=$(metadata_file_for_dir "$pkgdir")
+  default_name=$(basename "$pkgdir")
+  [[ -f $metadata ]] || return 1
+  jq -er --arg default_name "$default_name" '
+    (.outputs // [$default_name]) as $outputs |
+    if ($outputs | type) != "array" or ($outputs | length) == 0 or
+       any($outputs[]; type != "string" or
+           (test("^[A-Za-z0-9@._+:-]+$") | not)) or
+       (($outputs | unique | length) != ($outputs | length))
+    then error("invalid outputs")
+    else $outputs[]
+    end
+  ' "$metadata"
+}
+
 # Channel membership: where a package may be published. Packages without a
 # `channels` key are members of every channel (they flow edge -> rc -> stable).
 package_has_channels() {

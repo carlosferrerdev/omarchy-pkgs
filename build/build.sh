@@ -12,6 +12,7 @@ BUILD_OUTPUT_DIR=${BUILD_OUTPUT_DIR:-/build-output/$MIRROR/$ARCH}
 FINAL_OUTPUT_DIR=${FINAL_OUTPUT_DIR:-/pkgs.omarchy.org/$MIRROR/$ARCH}
 HELPERS_DIR=${HELPERS_DIR:-/helpers}
 SRC_DIR=${SRC_DIR:-/src}
+BUILD_PLAN_FILE=${BUILD_PLAN_FILE:-}
 
 source "$HELPERS_DIR/package-metadata.sh"
 
@@ -19,7 +20,11 @@ if [[ "$DRY_RUN" != true ]]; then
   # Import GPG keys
   /build/import-gpg-keys.sh || exit 1
 
-  mkdir -p "$BUILD_OUTPUT_DIR" "$FINAL_OUTPUT_DIR"
+  mkdir -p "$BUILD_OUTPUT_DIR"
+  if [[ ! -d "$FINAL_OUTPUT_DIR" ]]; then
+    echo "Final repository is unavailable: $FINAL_OUTPUT_DIR" >&2
+    exit 1
+  fi
 
   # Bring the container up to date before any makedepends are installed. The
   # image is layer-cached, so its glibc drifts behind the mirror while makepkg
@@ -57,12 +62,14 @@ EOF
     fi
   fi
 
-  # Add omarchy repo if it has a database (stable packages)
+  # Add the local final-output repo if it has a database. This is an isolated
+  # build workspace, and signatures are applied and cryptographically checked
+  # during promotion; dependency resolution here must not bootstrap trust.
   if [[ -f "$FINAL_OUTPUT_DIR/omarchy.db.tar.zst" ]] || [[ -f "$FINAL_OUTPUT_DIR/omarchy.db" ]]; then
     sudo tee -a /etc/pacman.conf > /dev/null <<EOF
 
 [omarchy]
-SigLevel = Optional TrustAll
+SigLevel = Never
 Server = file://$FINAL_OUTPUT_DIR
 EOF
     echo "  -> omarchy (priority 2): $FINAL_OUTPUT_DIR"
@@ -328,8 +335,8 @@ get_package_deps() {
   # Extract depends and makedepends, filter for packages in our pkgbuilds/
   (
     source "$pkgbuild" 2>/dev/null
-    echo "${depends[@]} ${makedepends[@]}"
-  ) | tr ' ' '\n' | while read -r dep; do
+    printf '%s\n' "${depends[@]}" "${makedepends[@]}"
+  ) | while read -r dep; do
     # Strip version constraints (e.g., 'hyprshade>=1.0' -> 'hyprshade')
     dep=$(echo "$dep" | sed 's/[<>=].*$//')
     # Check if this dependency exists in our pkgbuilds
@@ -489,10 +496,22 @@ else
   done < <(collect_packages)
 fi
 
+if [[ -n $BUILD_PLAN_FILE ]]; then
+  [[ $BUILD_PLAN_FILE == /* && ! -L $BUILD_PLAN_FILE ]] || {
+    echo "ERROR: BUILD_PLAN_FILE must be an absolute non-symlink path" >&2
+    exit 1
+  }
+  : >"$BUILD_PLAN_FILE"
+  for pkg in "${PACKAGES_TO_BUILD[@]}"; do
+    printf '%s\n' "$pkg" >>"$BUILD_PLAN_FILE"
+  done
+  chmod 0644 "$BUILD_PLAN_FILE"
+fi
+
 if [[ ${#PACKAGES_TO_BUILD[@]} -eq 0 ]]; then
   echo "==> All packages are up to date!"
 else
-  echo "==> ${#PACKAGES_TO_BUILD[@]} package(s) need building: ${PACKAGES_TO_BUILD[@]}"
+  echo "==> ${#PACKAGES_TO_BUILD[@]} package(s) need building: ${PACKAGES_TO_BUILD[*]}"
   echo "==> Determining build order based on dependencies..."
 
   # Second pass: order only the packages that need building
@@ -551,11 +570,11 @@ else
     exit 1
   fi
 
-  echo "==> Build order: ${ORDERED_PACKAGES[@]}"
+  echo "==> Build order: ${ORDERED_PACKAGES[*]}"
 
   if [[ "$DRY_RUN" == true ]]; then
     echo ""
-    echo "==> Dry run complete. Packages that would build: ${ORDERED_PACKAGES[@]}"
+    echo "==> Dry run complete. Packages that would build: ${ORDERED_PACKAGES[*]}"
     exit 0
   fi
 
@@ -572,7 +591,7 @@ else
   done
 
   if [[ ${#INSTALL_PACKAGES[@]} -gt 0 ]]; then
-    echo "==> Packages needed as dependencies: ${!INSTALL_PACKAGES[@]}"
+    echo "==> Packages needed as dependencies: ${!INSTALL_PACKAGES[*]}"
   fi
 
   # Build packages in dependency order

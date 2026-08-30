@@ -1,16 +1,15 @@
 # ==============================================================================
-# Omarchy Package Builder - Multi-Architecture
+# Gomarchy Package Builder - Multi-Architecture
 # Supports: x86_64 (Arch Linux) and aarch64 (Arch Linux ARM)
 # ==============================================================================
 
 # ------------------------------------------------------------------------------
 # Stage 1: Bootstrap - Create base Arch/ALARM system from scratch
 # ------------------------------------------------------------------------------
-FROM docker.io/alpine:3.21 AS bootstrapper
+FROM docker.io/library/alpine:3.21.7@sha256:48b0309ca019d89d40f670aa1bc06e426dc0931948452e8491e3d65087abc07d AS bootstrapper
 
 ARG TARGETARCH
 ARG BUILDPLATFORM
-ARG MIRROR=edge
 
 COPY pacstrap-docker /usr/local/bin/
 
@@ -37,31 +36,47 @@ RUN mkdir -p /etc/pacman.d && \
     printf '[options]\nHoldPkg = pacman glibc\nArchitecture = auto\nSigLevel = Required DatabaseOptional\nLocalFileSigLevel = Optional\n\n%b' "$REPOS" > /etc/pacman.conf
 
 RUN if [ "${TARGETARCH}" = "amd64" ]; then \
-        if [ "${MIRROR}" = "stable" ]; then \
-            printf 'Server = https://stable-mirror.omarchy.org/$repo/os/$arch\n' > /etc/pacman.d/mirrorlist; \
-        elif [ "${MIRROR}" = "rc" ]; then \
-            printf 'Server = https://rc-mirror.omarchy.org/$repo/os/$arch\n' > /etc/pacman.d/mirrorlist; \
-        else \
-            printf 'Server = https://mirror.omarchy.org/$repo/os/$arch\n' > /etc/pacman.d/mirrorlist; \
-        fi; \
+        printf 'Server = https://geo.mirror.pkgbuild.com/$repo/os/$arch\n' > /etc/pacman.d/mirrorlist; \
     else \
-        curl -L "https://raw.githubusercontent.com/archlinuxarm/PKGBUILDs/master/core/pacman-mirrorlist/mirrorlist" 2>/dev/null | \
-            sed -E 's/^\s*#\s*Server\s*=/Server =/g' > /etc/pacman.d/mirrorlist && \
+        ALARM_PKGBUILDS_COMMIT="c9df006bd10533df2d59a94cc0c565897cf945b6" && \
+        ALARM_MIRRORLIST_SHA256="e25f0bc284287342b221377d2a0ca0203eaf13f52d369d6676c4730a8e2b1de1" && \
+        ALARM_MIRRORLIST="/tmp/archlinuxarm-mirrorlist" && \
+        curl -fsSL \
+            "https://raw.githubusercontent.com/archlinuxarm/PKGBUILDs/${ALARM_PKGBUILDS_COMMIT}/core/pacman-mirrorlist/mirrorlist" \
+            -o "${ALARM_MIRRORLIST}" && \
+        printf '%s  %s\n' "${ALARM_MIRRORLIST_SHA256}" "${ALARM_MIRRORLIST}" | sha256sum -c - && \
+        sed -E 's/^\s*#\s*Server\s*=/Server =/g' "${ALARM_MIRRORLIST}" > /etc/pacman.d/mirrorlist && \
         sed -i 's/\$arch/aarch64/g' /etc/pacman.d/mirrorlist; \
     fi
 
 # Bootstrap keyrings (required before pacstrap can verify packages)
 RUN mkdir -p /usr/share/pacman/keyrings && \
     if [ "${TARGETARCH}" = "arm64" ]; then \
-        KEYRING_URL="https://raw.githubusercontent.com/archlinuxarm/PKGBUILDs/master/core/archlinuxarm-keyring/" && \
-        for file in archlinuxarm-revoked archlinuxarm-trusted archlinuxarm.gpg; do \
-            curl -fsSL "${KEYRING_URL}${file}" -o /usr/share/pacman/keyrings/${file} || exit 1; \
-        done && \
+        ALARM_PKGBUILDS_COMMIT="c9df006bd10533df2d59a94cc0c565897cf945b6" && \
+        KEYRING_URL="https://raw.githubusercontent.com/archlinuxarm/PKGBUILDs/${ALARM_PKGBUILDS_COMMIT}/core/archlinuxarm-keyring" && \
+        curl -fsSL "${KEYRING_URL}/archlinuxarm-revoked" -o /usr/share/pacman/keyrings/archlinuxarm-revoked && \
+        printf '%s  %s\n' \
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855" \
+            "/usr/share/pacman/keyrings/archlinuxarm-revoked" | sha256sum -c - && \
+        curl -fsSL "${KEYRING_URL}/archlinuxarm-trusted" -o /usr/share/pacman/keyrings/archlinuxarm-trusted && \
+        printf '%s  %s\n' \
+            "f2a7250f2a2b77542f82f4219b2bae7895f27b3dcfdf350b497e2be306af776d" \
+            "/usr/share/pacman/keyrings/archlinuxarm-trusted" | sha256sum -c - && \
+        curl -fsSL "${KEYRING_URL}/archlinuxarm.gpg" -o /usr/share/pacman/keyrings/archlinuxarm.gpg && \
+        printf '%s  %s\n' \
+            "6ce771e853f04a38a5b533cb33e61f877b9b06b58b6db051eb8a15d737a2332f" \
+            "/usr/share/pacman/keyrings/archlinuxarm.gpg" | sha256sum -c - && \
         BOOTSTRAP_EXTRA="archlinuxarm-keyring"; \
     else \
         mkdir /tmp/archlinux-keyring && \
-        curl -fsSL https://archlinux.org/packages/core/any/archlinux-keyring/download | \
-            unzstd | tar -C /tmp/archlinux-keyring -xv && \
+        ARCH_KEYRING_PACKAGE="/tmp/archlinux-keyring-20260727-1-any.pkg.tar.zst" && \
+        curl -fsSL \
+            "https://archive.archlinux.org/packages/a/archlinux-keyring/archlinux-keyring-20260727-1-any.pkg.tar.zst" \
+            -o "${ARCH_KEYRING_PACKAGE}" && \
+        printf '%s  %s\n' \
+            "694c4236ff403b5be549436d2df2910092cb6d778bb027fd232be9dddf4ea090" \
+            "${ARCH_KEYRING_PACKAGE}" | sha256sum -c - && \
+        unzstd < "${ARCH_KEYRING_PACKAGE}" | tar -C /tmp/archlinux-keyring -xv && \
         mv /tmp/archlinux-keyring/usr/share/pacman/keyrings/* /usr/share/pacman/keyrings/ && \
         BOOTSTRAP_EXTRA=""; \
     fi && \
@@ -105,19 +120,6 @@ RUN ln -sf /usr/lib/os-release /etc/os-release && \
         pacman-key --populate archlinux; \
     fi
 
-# Setup Omarchy keyring manually before adding repo (avoids keyserver trust issues)
-# Note: Repository is removed at the end since build scripts add it dynamically.
-# The keyring comes from this image's own channel (the bare /$arch path is a
-# stale legacy layout); %s keeps pacman's $arch literal while MIRROR expands.
-ARG MIRROR=edge
-RUN pacman-key --recv-keys 40DFB630FF42BCFFB047046CF0134EE680CAC571 --keyserver keys.openpgp.org && \
-    pacman-key --lsign-key 40DFB630FF42BCFFB047046CF0134EE680CAC571 && \
-    printf '\n[omarchy]\nSigLevel = Optional\nServer = https://pkgs.omarchy.org/%s/$arch\n' "${MIRROR}" >> /etc/pacman.conf && \
-    pacman -Sy --noconfirm && \
-    pacman -S --noconfirm omarchy-keyring && \
-    pacman-key --populate omarchy && \
-    sed -i '/^\[omarchy\]/,/^$/d' /etc/pacman.conf
-
 RUN pacman -Syu --noconfirm && \
     pacman -S --noconfirm \
         base-devel \
@@ -130,12 +132,16 @@ RUN pacman -Syu --noconfirm && \
     pacman -Scc --noconfirm && \
     rm -rf /var/cache/pacman/pkg/*
 
-# makepkg cannot run as root
-RUN useradd -m -G wheel -s /bin/bash builder && \
+# makepkg cannot run as root. Match the invoking non-root host UID when one is
+# available; repository hosts run as root and deliberately use the unprivileged
+# default 1000 instead.
+ARG BUILDER_UID=1000
+RUN groupadd -g "${BUILDER_UID}" builder && \
+    useradd -m -u "${BUILDER_UID}" -g builder -G wheel -s /bin/bash builder && \
     echo "builder ALL=(ALL) NOPASSWD: ALL" >> /etc/sudoers && \
-    mkdir -p /home/builder/.gnupg && \
+    mkdir -p /home/builder/.gnupg /build-output && \
     chmod 700 /home/builder/.gnupg && \
-    chown -R builder:builder /home/builder
+    chown -R builder:builder /home/builder /build-output
 
 RUN sed -i 's/^#MAKEFLAGS=.*/MAKEFLAGS="-j$(nproc)"/' /etc/makepkg.conf && \
     sed -i 's/^COMPRESSZST=.*/COMPRESSZST=(zstd -c -z -q --threads=0 -)/' /etc/makepkg.conf
@@ -153,7 +159,7 @@ WORKDIR /src
 
 CMD ["/bin/bash"]
 
-LABEL maintainer="Omarchy <https://omarchy.org>"
-LABEL description="Multi-architecture Arch Linux package build environment"
+LABEL maintainer="Gomarchy contributors"
+LABEL description="Gomarchy multi-architecture Arch Linux package build environment"
 LABEL version="2.0"
 LABEL architectures="x86_64,aarch64"

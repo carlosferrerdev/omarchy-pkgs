@@ -12,7 +12,7 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           persist-credentials: false
 
@@ -23,10 +23,14 @@ jobs:
           docker run --rm \
             -v "$PWD:/workspace:ro" \
             -w /workspace \
-            archlinux:base-devel bash -lc '
+            docker.io/archlinux/archlinux:base-devel-20260829.0.582217@sha256:fdb1815d139014c57a768896ed60d52e67d757914c918b7c3a50b7218373ec5f bash -lc '
               set -euo pipefail
-              pacman -Syu --noconfirm jq
+              pacman -Syu --noconfirm git jq
               ./bin/sync-upstream self-test
               ./bin/omarchy-pkgs self-test
               ./bin/omarchy-release self-test
+              ./bin/sync-rebuilds --self-test
+              for test_script in test/*.sh; do
+                bash "$test_script"
+              done
             '

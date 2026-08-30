@@ -1,23 +1,101 @@
-# Maintainer: Omarchy <pkgs@omarchy.org>
+# Maintainer: Gomarchy contributors
 
 pkgname=omarchy-keyring
-pkgver=20251027
+pkgver=20260829
 pkgrel=1
-pkgdesc="Omarchy keyring"
+pkgdesc="Gomarchy package signing keyring (compatibility package name)"
 arch=(any)
-url="https://omarchy.org"
+url="https://github.com/carlosferrerdev/prumo"
 license=('GPL-3.0-or-later')
 install=$pkgname.install
 source=("omarchy.gpg"
         "omarchy-revoked"
         "omarchy-trusted"
+        "repository.conf"
         "$install")
+backup=('etc/omarchy/repository.conf')
 
-sha512sums=('f9455c60f30984d73ddebecf55a1b6dcb3afba84638c5d78130494bb828f53cfa19d393c27e43514d5847b37dcd0a5601ba39b213c2185ff153001b7221c9c8c'
+# omarchy.gpg, omarchy-trusted, and repository.conf are generated only after
+# bin/build cryptographically validates the explicit release trust contract.
+sha512sums=('SKIP'
             'cf83e1357eefb8bdf1542850d66d8007d620e4050b5715dc83f4a921d36ce9ce47d0d13c5d85f2b0ff8318d2877eec2f63b931bd47417a81a538327af927da3e'
-            '39767d13b783903d97f68e23100982c645356c7f7dbd9625ae41f4fa217c937f09e0f5dd8e0741f0950f2d9418a160dbce7563e1f4a4599d545e38f986fd8fb9'
+            'SKIP'
+            'SKIP'
             'b684c496b6866dfea05595965727709ef63b9abe6a89276b89f0dba0271112a0184a934884a6d53d1c5f4d6a01ac36c6d296ce475f5c7d10a11ee397e2926194')
+
+prepare() {
+    local expected_fingerprint="${OMARCHY_PKGS_TRUST_KEY_FINGERPRINT:-}"
+    local expected_base="${OMARCHY_PKGS_DB_BASE:-}"
+    local inspection inspection_home primary_fingerprints primary_count primary_unsafe_count secret_count authority host key_identities
+
+    [[ "$expected_fingerprint" =~ ^[A-F0-9]{40}$ ]] || {
+        echo "Missing validated Gomarchy package trust fingerprint" >&2
+        return 1
+    }
+    [[ "$expected_fingerprint" != '40DFB630FF42BCFFB047046CF0134EE680CAC571' ]] || {
+        echo "Refusing the upstream Omarchy package trust root" >&2
+        return 1
+    }
+    [[ "$expected_base" =~ ^https://[A-Za-z0-9.-]+(:[0-9]+)?(/[A-Za-z0-9._~/-]*)?$ && "$expected_base" != */ ]] || {
+        echo "Missing validated Gomarchy package database base" >&2
+        return 1
+    }
+    authority=${expected_base#https://}
+    authority=${authority%%/*}
+    host=${authority%%:*}
+    host=$(tr '[:upper:]' '[:lower:]' <<<"$host")
+    host=${host%.}
+    [[ "$host" =~ ^([a-z0-9]([a-z0-9-]*[a-z0-9])?\.)+[a-z0-9]([a-z0-9-]*[a-z0-9])?$ ]] || {
+        echo "Gomarchy package database host is not valid" >&2
+        return 1
+    }
+    [[ "$host" != 'omarchy.org' && "$host" != *.omarchy.org ]] || {
+        echo "Refusing an upstream Omarchy package database" >&2
+        return 1
+    }
+
+    [[ "$(<omarchy-trusted)" == "$expected_fingerprint:4:" ]] || {
+        echo "Generated trusted-owner file does not match the build trust root" >&2
+        return 1
+    }
+    [[ "$(<repository.conf)" == "schema=1
+base_url=$expected_base
+trust_fingerprint=$expected_fingerprint" ]] || {
+        echo "Generated repository contract does not match the build trust contract" >&2
+        return 1
+    }
+
+    inspection_home=$(mktemp -d) || return 1
+    chmod 0700 "$inspection_home"
+    inspection=$(gpg --batch --no-options --homedir "$inspection_home" --show-keys \
+        --with-colons --fingerprint --fingerprint omarchy.gpg 2>/dev/null) || {
+        rm -rf -- "$inspection_home"
+        echo "Generated Gomarchy keyring is not valid OpenPGP public material" >&2
+        return 1
+    }
+    rm -rf -- "$inspection_home"
+    secret_count=$(awk -F: '$1 == "sec" { count++ } END { print count + 0 }' <<<"$inspection")
+    ((secret_count == 0)) || {
+        echo "Generated Gomarchy keyring contains secret material" >&2
+        return 1
+    }
+    key_identities=$(awk -F: '
+        $1 == "pub" || $1 == "sub" { type=$1; validity=$2; capabilities=$12; next }
+        type != "" && $1 == "fpr" {
+            print type ":" toupper($10) ":" validity ":" capabilities
+            type=""
+        }
+    ' <<<"$inspection")
+    primary_fingerprints=$(awk -F: '$1 == "pub" { print $2 }' <<<"$key_identities")
+    primary_unsafe_count=$(awk -F: '$1 == "pub" && ($3 ~ /^[erd]$/ || $4 ~ /D/) { count++ } END { print count + 0 }' <<<"$key_identities")
+    primary_count=$(awk 'NF { count++ } END { print count + 0 }' <<<"$primary_fingerprints")
+    [[ "$primary_count" == 1 && "$primary_fingerprints" == "$expected_fingerprint" && "$primary_unsafe_count" == 0 ]] || {
+        echo "Generated Gomarchy keyring does not contain exactly the configured primary" >&2
+        return 1
+    }
+}
 
 package() {
     install -D -m0644 -t "${pkgdir}"/usr/share/pacman/keyrings/ 'omarchy'{.gpg,-trusted,-revoked}
+    install -D -m0644 repository.conf "${pkgdir}"/etc/omarchy/repository.conf
 }

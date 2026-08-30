@@ -1,0 +1,233 @@
+# Maintainer: Gomarchy maintainers
+# Based on the Arch Linux kernel package and the T2 Linux Arch recipe.
+
+pkgbase=linux-t2
+pkgver=7.1.8.arch1
+pkgrel=4.1
+pkgdesc='Linux kernel with Apple T2 hardware support'
+url='https://github.com/t2linux/linux-t2-patches'
+arch=(x86_64)
+license=(GPL-2.0-only)
+makedepends=(
+  bc
+  binutils
+  cpio
+  gettext
+  glibc
+  libelf
+  libgcc
+  openssl
+  pahole
+  perl
+  python
+  rust
+  rust-bindgen
+  rust-src
+  tar
+  xxhash
+  xz
+  zlib
+  zstd
+)
+options=(!debug !strip)
+
+_srcname="linux-${pkgver%.*}"
+_srctag="v${pkgver%.*}-${pkgver##*.}"
+_arch_recipe_commit=8e53dff21ce5174998134f75d491572490b79910
+_arch_recipe_dir="linux-t2-arch-$_arch_recipe_commit"
+_t2_patch_commit=c032e3d86fa6ab7562b514d5f91f041518984a32
+_t2_patch_dir="linux-t2-patches-$_t2_patch_commit"
+source=(
+  "https://cdn.kernel.org/pub/linux/kernel/v${pkgver%%.*}.x/${_srcname}.tar.xz"
+  "https://cdn.kernel.org/pub/linux/kernel/v${pkgver%%.*}.x/${_srcname}.tar.sign"
+  "https://github.com/archlinux/linux/releases/download/$_srctag/linux-$_srctag.patch.zst"
+  "https://github.com/archlinux/linux/releases/download/$_srctag/linux-$_srctag.patch.zst.sig"
+  "linux-t2-arch-$_arch_recipe_commit.tar.gz::https://codeload.github.com/NoaHimesaka1873/linux-t2-arch/tar.gz/$_arch_recipe_commit"
+  "linux-t2-patches-$_t2_patch_commit.tar.gz::https://codeload.github.com/t2linux/linux-t2-patches/tar.gz/$_t2_patch_commit"
+)
+validpgpkeys=(
+  ABAF11C65A2970B130ABE3C479BE3E4300411886  # Linus Torvalds
+  647F28654894E3BD457199BE38DBBDC86092693E  # Greg Kroah-Hartman
+  83BC8889351B5DEBBB68416EB8AC08600F108CDF  # Jan Alexander Steffens
+)
+sha256sums=(
+  ff01dcb449279d5b4cfccdb01fee639cf5ff1803f1749a77844dd33915422c49
+  SKIP
+  351cfb04db323bf5dd55ae8ce626650d20ba61441d202cadd8e198c6b9ef8f36
+  SKIP
+  c9c7d3a34d8337513b815eed6b6f531f2354a6de38d70ac76eaf08c66d62a30f
+  31f775ac7f175bee477b919d8bb16d45e405a83a63c5c38f06f2799e915fde0e
+)
+
+export KBUILD_BUILD_HOST=archlinux
+export KBUILD_BUILD_USER=$pkgbase
+export KBUILD_BUILD_TIMESTAMP="$(date -Ru${SOURCE_DATE_EPOCH:+d @$SOURCE_DATE_EPOCH})"
+
+prepare() {
+  cd "$_srcname"
+
+  echo "-$pkgrel" >localversion.10-pkgrel
+  echo "${pkgbase#linux}" >localversion.20-pkgname
+
+  local src patch_file
+  for src in "${source[@]:0:4}"; do
+    src="${src%%::*}"
+    src="${src##*/}"
+    src="${src%.zst}"
+    [[ $src == *.patch ]] || continue
+    patch -Np1 <"$srcdir/$src"
+  done
+
+  while IFS= read -r patch_file; do
+    patch -Np1 <"$patch_file"
+  done < <(find "$srcdir/$_t2_patch_dir" -maxdepth 1 -type f -name '*.patch' -print | sort)
+
+  cp "$srcdir/$_arch_recipe_dir/config.x86_64" .config
+  cat "$srcdir/$_t2_patch_dir/extra_config" >>.config
+  make olddefconfig
+  diff -u "$srcdir/$_arch_recipe_dir/config.x86_64" .config || :
+
+  make -s kernelrelease >version
+  printf 'Prepared %s version %s\n' "$pkgbase" "$(<version)"
+}
+
+build() {
+  cd "$_srcname"
+  make all
+  make -C tools/bpf/bpftool vmlinux.h feature-clang-bpf-co-re=1
+}
+
+_package() {
+  pkgdesc="The $pkgdesc kernel and modules"
+  depends=(
+    coreutils
+    initramfs
+    kmod
+  )
+  optdepends=(
+    "$pkgbase-headers: headers and scripts for building modules"
+    'linux-firmware: firmware images needed for some devices'
+    'scx-scheds: sched-ext schedulers'
+    'wireless-regdb: correct wireless channels for the configured country'
+  )
+  provides=(
+    KSMBD-MODULE
+    NTSYNC-MODULE
+    VIRTUALBOX-GUEST-MODULES
+    WIREGUARD-MODULE
+    linux
+  )
+  conflicts=(apple-gmux-t2-dkms-git)
+  replaces=(
+    apple-gmux-t2-dkms-git
+    virtualbox-guest-modules-arch
+    wireguard-arch
+  )
+
+  cd "$_srcname"
+  local modulesdir="$pkgdir/usr/lib/modules/$(<version)"
+
+  install -Dm644 "$(make -s image_name)" "$modulesdir/vmlinuz"
+  echo "$pkgbase" | install -Dm644 /dev/stdin "$modulesdir/pkgbase"
+
+  ZSTD_CLEVEL=19 make INSTALL_MOD_PATH="$pkgdir/usr" INSTALL_MOD_STRIP=1 \
+    DEPMOD=/doesnt/exist modules_install
+  rm "$modulesdir/build"
+}
+
+_package-headers() {
+  pkgdesc="Headers and scripts for building modules for the $pkgdesc kernel"
+  depends=(
+    binutils
+    glibc
+    libelf
+    libgcc
+    openssl
+    pahole
+    xxhash
+    zlib
+    zstd
+  )
+  provides=(LINUX-HEADERS linux-headers)
+
+  cd "$_srcname"
+  local builddir="$pkgdir/usr/lib/modules/$(<version)/build"
+  local karch=x86
+
+  install -Dt "$builddir" -m644 .config Makefile Module.symvers System.map \
+    localversion.* version vmlinux tools/bpf/bpftool/vmlinux.h
+  install -Dt "$builddir/kernel" -m644 kernel/Makefile
+  install -Dt "$builddir/arch/$karch" -m644 "arch/$karch/Makefile"
+  cp -t "$builddir" -a scripts
+  ln -srt "$builddir" "$builddir/scripts/gdb/vmlinux-gdb.py"
+
+  if [[ $(scripts/config -s CONFIG_HAVE_STACK_VALIDATION) == y ]]; then
+    install -Dt "$builddir/tools/objtool" tools/objtool/objtool
+  fi
+  if [[ $(scripts/config -s CONFIG_DEBUG_INFO_BTF_MODULES) == y ]]; then
+    install -Dt "$builddir/tools/bpf/resolve_btfids" \
+      tools/bpf/resolve_btfids/resolve_btfids
+  fi
+
+  cp -t "$builddir" -a include
+  cp -t "$builddir/arch/$karch" -a "arch/$karch/include"
+  install -Dt "$builddir/arch/$karch/kernel" -m644 \
+    "arch/$karch/kernel/asm-offsets.s"
+  install -Dt "$builddir/drivers/md" -m644 drivers/md/*.h
+  install -Dt "$builddir/net/mac80211" -m644 net/mac80211/*.h
+  install -Dt "$builddir/drivers/media/i2c" -m644 \
+    drivers/media/i2c/msp3400-driver.h
+  install -Dt "$builddir/drivers/media/usb/dvb-usb" -m644 \
+    drivers/media/usb/dvb-usb/*.h
+  install -Dt "$builddir/drivers/media/dvb-frontends" -m644 \
+    drivers/media/dvb-frontends/*.h
+  install -Dt "$builddir/drivers/media/tuners" -m644 \
+    drivers/media/tuners/*.h
+  install -Dt "$builddir/drivers/iio/common/hid-sensors" -m644 \
+    drivers/iio/common/hid-sensors/*.h
+
+  find . -name 'Kconfig*' -exec install -Dm644 {} "$builddir/{}" \;
+
+  if [[ $(scripts/config -s CONFIG_RUST) == y ]]; then
+    install -Dt "$builddir/rust" -m644 rust/*.rmeta
+    install -Dt "$builddir/rust" rust/*.so
+  fi
+
+  make INSTALL_MOD_PATH="$pkgdir/usr" vdso_install link=
+
+  local other_arch
+  for other_arch in "$builddir"/arch/*/; do
+    [[ $other_arch == */$karch/ ]] && continue
+    rm -r "$other_arch"
+  done
+  rm -r "$builddir/Documentation"
+  find -L "$builddir" -type l -delete
+  find "$builddir" -type f -name '*.o' -delete
+
+  local file
+  while read -rd '' file; do
+    case "$(file -Sib "$file")" in
+      application/x-sharedlib\;*) strip -v $STRIP_SHARED "$file" ;;
+      application/x-archive\;*) strip -v $STRIP_STATIC "$file" ;;
+      application/x-executable\;*) strip -v $STRIP_BINARIES "$file" ;;
+      application/x-pie-executable\;*) strip -v $STRIP_SHARED "$file" ;;
+    esac
+  done < <(find "$builddir" -type f -perm -u+x ! -name vmlinux -print0)
+  strip -v $STRIP_STATIC "$builddir/vmlinux"
+
+  mkdir -p "$pkgdir/usr/src"
+  ln -sr "$builddir" "$pkgdir/usr/src/$pkgbase"
+}
+
+pkgname=(
+  "$pkgbase"
+  "$pkgbase-headers"
+)
+for _package_name in "${pkgname[@]}"; do
+  eval "package_$_package_name() {
+    $(declare -f "_package${_package_name#$pkgbase}")
+    _package${_package_name#$pkgbase}
+  }"
+done
+
+# vim:set ts=8 sts=2 sw=2 et:

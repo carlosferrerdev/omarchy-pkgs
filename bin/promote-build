@@ -1,12 +1,140 @@
 #!/bin/bash
 # Promote packages from build-output to pkgs.omarchy.org
 
-set -e
+set -euo pipefail
+
+unset GPG_PRIVATE_KEY GPG_PASSPHRASE
 
 BUILD_ROOT=$(realpath "${BASH_SOURCE[0]%/*}/..")
 source "$BUILD_ROOT/helpers/message-helpers.sh"
 source "$BUILD_ROOT/helpers/paths.sh"
 source "$BUILD_ROOT/helpers/lock-helpers.sh"
+
+VERIFY_GNUPGHOME=""
+
+cleanup() {
+  if [[ -n "$VERIFY_GNUPGHOME" && -d "$VERIFY_GNUPGHOME" ]]; then
+    gpgconf --homedir "$VERIFY_GNUPGHOME" --kill gpg-agent >/dev/null 2>&1 || true
+    rm -rf -- "$VERIFY_GNUPGHOME"
+  fi
+}
+
+verify_exact_signature() {
+  local package_file="$1"
+  local signature_file="$2"
+  local status
+
+  status=$(gpg --batch --no-auto-key-retrieve --homedir "$VERIFY_GNUPGHOME" --status-fd 1 \
+    --verify "$signature_file" "$package_file" 2>/dev/null) || return 1
+
+  awk -v wanted="$SIGNING_FINGERPRINT" '
+    $1 == "[GNUPG:]" && $2 ~ /^(BADSIG|ERRSIG|EXPSIG|EXPKEYSIG|REVKEYSIG|NO_PUBKEY|KEYEXPIRED|SIGEXPIRED)$/ {
+      unsafe++
+    }
+    $1 == "[GNUPG:]" && $2 == "VALIDSIG" {
+      valid++
+      if (toupper($3) == wanted) exact++
+    }
+    END { exit !(valid == 1 && exact == 1 && unsafe == 0) }
+  ' <<<"$status"
+}
+
+prepare_verification_keyring() {
+  local public_key_file="${OMARCHY_PKGS_SIGNING_PUBLIC_KEY_FILE:-}"
+  local public_key_count
+  local primary_record primary_validity primary_fingerprint
+  local key_record
+
+  if [[ ! "${OMARCHY_PKGS_SIGNING_KEY_FINGERPRINT:-}" =~ ^[[:xdigit:]]{40}$ ]]; then
+    print_error "OMARCHY_PKGS_SIGNING_KEY_FINGERPRINT must be a full 40-character hexadecimal fingerprint"
+    return 1
+  fi
+  SIGNING_FINGERPRINT=$(printf '%s' "$OMARCHY_PKGS_SIGNING_KEY_FINGERPRINT" | tr '[:lower:]' '[:upper:]')
+
+  if [[ ! "${OMARCHY_PKGS_TRUST_KEY_FINGERPRINT:-}" =~ ^[[:xdigit:]]{40}$ ]]; then
+    print_error "OMARCHY_PKGS_TRUST_KEY_FINGERPRINT must be a full 40-character hexadecimal primary-key fingerprint"
+    return 1
+  fi
+  TRUST_FINGERPRINT=$(printf '%s' "$OMARCHY_PKGS_TRUST_KEY_FINGERPRINT" | tr '[:lower:]' '[:upper:]')
+
+  if [[ "$public_key_file" != /* || ! -f "$public_key_file" || -L "$public_key_file" ]]; then
+    print_error "OMARCHY_PKGS_SIGNING_PUBLIC_KEY_FILE must name an absolute, regular, non-symlink public key file"
+    return 1
+  fi
+
+  command -v gpg >/dev/null 2>&1 || {
+    print_error "gpg is required to verify package signatures"
+    return 1
+  }
+
+  VERIFY_GNUPGHOME=$(mktemp -d)
+  chmod 700 "$VERIFY_GNUPGHOME"
+  trap cleanup EXIT
+
+  if ! gpg --batch --homedir "$VERIFY_GNUPGHOME" --import "$public_key_file" >/dev/null 2>&1; then
+    print_error "Could not import OMARCHY_PKGS_SIGNING_PUBLIC_KEY_FILE"
+    return 1
+  fi
+
+  if gpg --batch --homedir "$VERIFY_GNUPGHOME" --with-colons \
+    --list-secret-keys 2>/dev/null | grep -q '^sec:'; then
+    print_error "OMARCHY_PKGS_SIGNING_PUBLIC_KEY_FILE must not contain secret key material"
+    return 1
+  fi
+
+  public_key_count=$(
+    gpg --batch --homedir "$VERIFY_GNUPGHOME" --with-colons --list-keys 2>/dev/null |
+      awk -F: '$1 == "pub" { count++ } END { print count + 0 }'
+  )
+  if [[ "$public_key_count" -ne 1 ]]; then
+    print_error "Signing public key file must contain exactly one primary public key"
+    return 1
+  fi
+
+  primary_record=$(
+    gpg --batch --homedir "$VERIFY_GNUPGHOME" --with-colons --fingerprint \
+      --list-keys 2>/dev/null |
+      awk -F: '
+        $1 == "pub" { primary=1; validity=$2; next }
+        primary && $1 == "fpr" { print validity ":" toupper($10); exit }
+      '
+  )
+  primary_validity=${primary_record%%:*}
+  primary_fingerprint=${primary_record#*:}
+  if [[ "$primary_fingerprint" != "$TRUST_FINGERPRINT" ]]; then
+    print_error "Public key primary fingerprint does not match OMARCHY_PKGS_TRUST_KEY_FINGERPRINT"
+    return 1
+  fi
+  if [[ $primary_validity =~ ^[erd]$ ]]; then
+    print_error "Configured primary trust key is revoked, expired, or disabled"
+    return 1
+  fi
+
+  if ! key_record=$(
+    gpg --batch --homedir "$VERIFY_GNUPGHOME" --with-colons --fingerprint --fingerprint \
+      --list-keys 2>/dev/null |
+      awk -F: -v wanted="$SIGNING_FINGERPRINT" '
+        $1 == "pub" || $1 == "sub" { type=$1; validity=$2; capabilities=$12; next }
+        $1 == "fpr" && toupper($10) == wanted {
+          matches++
+          matched_type=type
+          matched_validity=validity
+          matched_capabilities=capabilities
+        }
+        END {
+          if (matches != 1 || matched_validity ~ /^[erd]$/ ||
+              matched_capabilities !~ /[sS]/ || matched_capabilities ~ /D/) exit 1
+          print matched_type ":" matched_capabilities
+        }
+      '
+  ); then
+    print_error "Configured fingerprint does not identify exactly one signing-capable key or subkey in the public key file"
+    return 1
+  fi
+
+  print_info "Trusted primary key fingerprint: $TRUST_FINGERPRINT"
+  print_info "Using exact public ${key_record%%:*} signing fingerprint: $SIGNING_FINGERPRINT"
+}
 
 print_header "Promote Build to Production"
 
@@ -48,10 +176,6 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-if [[ "$DRY_RUN" != true ]]; then
-  acquire_release_lock || exit 1
-fi
-
 print_info "Mirror: $MIRROR"
 print_info "Build output: $BUILD_OUTPUT_DIR"
 print_info "Final output: $REPO_DIR"
@@ -63,9 +187,18 @@ if [[ ! -d "$BUILD_OUTPUT_DIR" ]]; then
   exit 1
 fi
 
-# Count packages in build output
+# Count packages in build output without relying on an ls/grep pipeline whose
+# no-match status becomes fatal under pipefail.
 cd "$BUILD_OUTPUT_DIR"
-PACKAGE_COUNT=$(ls -1 *.pkg.tar.* 2>/dev/null | grep -v '\.sig$' | grep -v 'omarchy-build\.db' | wc -l)
+PACKAGE_COUNT=0
+shopt -s nullglob
+for candidate in *.pkg.tar.*; do
+  [[ "$candidate" == *.sig ]] && continue
+  [[ "$candidate" == omarchy-build.db* ]] && continue
+  [[ "$candidate" == omarchy-build.files* ]] && continue
+  PACKAGE_COUNT=$((PACKAGE_COUNT + 1))
+done
+shopt -u nullglob
 
 if [[ $PACKAGE_COUNT -eq 0 ]]; then
   print_warning "No packages found in build output"
@@ -83,37 +216,66 @@ if [[ "$DRY_RUN" == true ]]; then
   done
 else
   echo ""
-  mkdir -p "$REPO_DIR"
+  prepare_verification_keyring
 
-  echo "==> Verifying all packages have signatures..."
-  MISSING_SIGS=()
+  echo "==> Cryptographically verifying package signatures..."
+  INVALID_SIGNATURES=()
   for pkg_file in *.pkg.tar.*; do
     # Skip build database files
     [[ "$pkg_file" == omarchy-build.db* ]] && continue
     [[ "$pkg_file" == omarchy-build.files* ]] && continue
     # Skip signature files themselves
     [[ "$pkg_file" == *.sig ]] && continue
-    [[ ! -f "$pkg_file" ]] && continue
 
-    # Check if signature exists
-    if [[ ! -f "$pkg_file.sig" ]]; then
-      MISSING_SIGS+=("$pkg_file")
+    if [[ ! -f "$pkg_file" || -L "$pkg_file" ]]; then
+      INVALID_SIGNATURES+=("$pkg_file (package is not a regular non-symlink file)")
+    elif [[ ! -f "$pkg_file.sig" || -L "$pkg_file.sig" ]]; then
+      INVALID_SIGNATURES+=("$pkg_file (missing or unsafe signature)")
+    elif ! verify_exact_signature "$pkg_file" "$pkg_file.sig"; then
+      INVALID_SIGNATURES+=("$pkg_file (invalid signature or unexpected signer)")
     fi
   done
 
-  if [[ ${#MISSING_SIGS[@]} -gt 0 ]]; then
+  # Nothing matching the package glob may bypass verification merely because
+  # it ends in .sig; an orphan signature would otherwise be moved below.
+  for signature_file in *.pkg.tar.*.sig; do
+    [[ -e "$signature_file" || -L "$signature_file" ]] || continue
+    pkg_file=${signature_file%.sig}
+    if [[ ! -f "$pkg_file" || -L "$pkg_file" ]]; then
+      INVALID_SIGNATURES+=("$signature_file (signature has no regular package)")
+    fi
+  done
+
+  if [[ ${#INVALID_SIGNATURES[@]} -gt 0 ]]; then
     echo ""
-    print_error "ERROR: The following packages are missing signatures:"
-    for pkg in "${MISSING_SIGS[@]}"; do
-      echo "  - $pkg (missing $pkg.sig)"
+    print_error "ERROR: The following packages failed signature verification:"
+    for failure in "${INVALID_SIGNATURES[@]}"; do
+      echo "  - $failure"
     done
     echo ""
-    print_error "All packages must be signed before promotion!"
+    print_error "Every package must have a valid signature by $SIGNING_FINGERPRINT before promotion!"
     echo ""
     echo "To fix this, run:"
     echo "  bin/repo sign --mirror $MIRROR --arch $ARCH"
     exit 1
   fi
+
+  print_success "All package signatures are valid and match $SIGNING_FINGERPRINT"
+
+  # Only now may promotion create a lock/destination or move artifacts.
+  acquire_release_lock || exit 1
+
+  # Close the verification-to-lock window. Another release process is now
+  # excluded; no artifact may have changed since the first complete preflight.
+  for pkg_file in *.pkg.tar.*; do
+    [[ "$pkg_file" == omarchy-build.db* || "$pkg_file" == omarchy-build.files* || "$pkg_file" == *.sig ]] && continue
+    if [[ ! -f $pkg_file || -L $pkg_file || ! -f $pkg_file.sig || -L $pkg_file.sig ]] ||
+      ! verify_exact_signature "$pkg_file" "$pkg_file.sig"; then
+      print_error "Build output changed while promotion acquired its release lock: $pkg_file"
+      exit 1
+    fi
+  done
+  mkdir -p "$REPO_DIR"
 
   # VCS packages (omarchy-dev and friends) are versioned off the upstream commit,
   # so rebuilding the same commit produces the same filename. That is harmless
@@ -131,8 +293,9 @@ else
     [[ "$pkg_file" == *.sig ]] && continue
     [[ ! -f "$pkg_file" ]] && continue
 
-    if [[ -f "$REPO_DIR/$pkg_file" ]]; then
-      if cmp -s "$pkg_file" "$REPO_DIR/$pkg_file"; then
+    if [[ -e "$REPO_DIR/$pkg_file" || -L "$REPO_DIR/$pkg_file" ]]; then
+      if [[ -f "$REPO_DIR/$pkg_file" && ! -L "$REPO_DIR/$pkg_file" ]] &&
+        cmp -s "$pkg_file" "$REPO_DIR/$pkg_file"; then
         ALREADY_PROMOTED["$pkg_file"]=1
       else
         CONFLICTS+=("$pkg_file")
@@ -144,10 +307,15 @@ else
   # byte. Judge them by the package they sign and keep the published signature.
   for pkg_file in *.pkg.tar.*.sig; do
     [[ ! -f "$pkg_file" ]] && continue
-    [[ -f "$REPO_DIR/$pkg_file" ]] || continue
+    [[ -e "$REPO_DIR/$pkg_file" || -L "$REPO_DIR/$pkg_file" ]] || continue
 
     if [[ -n "${ALREADY_PROMOTED[${pkg_file%.sig}]:-}" ]]; then
-      ALREADY_PROMOTED["$pkg_file"]=1
+      if [[ -f "$REPO_DIR/$pkg_file" && ! -L "$REPO_DIR/$pkg_file" ]] &&
+        verify_exact_signature "$REPO_DIR/${pkg_file%.sig}" "$REPO_DIR/$pkg_file"; then
+        ALREADY_PROMOTED["$pkg_file"]=1
+      else
+        print_warning "Replacing an unsafe or invalid published signature for ${pkg_file%.sig}"
+      fi
     else
       CONFLICTS+=("$pkg_file")
     fi

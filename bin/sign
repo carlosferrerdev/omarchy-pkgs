@@ -1,12 +1,24 @@
 #!/bin/bash
 # Sign all packages in build-output
 
-set -e
+set -euo pipefail
+
+unset GPG_PRIVATE_KEY GPG_PASSPHRASE
 
 BUILD_ROOT=$(realpath "${BASH_SOURCE[0]%/*}/..")
 source "$BUILD_ROOT/helpers/message-helpers.sh"
-source "$BUILD_ROOT/helpers/docker-helpers.sh"
 source "$BUILD_ROOT/helpers/paths.sh"
+source "$BUILD_ROOT/helpers/signing-secret-helpers.sh"
+
+SIGNING_SECRET_DIR=""
+
+cleanup_signing_secrets() {
+  case "$SIGNING_SECRET_DIR" in
+  "$SIGNING_SECRET_BASE"/gomarchy-sign.*)
+    [[ -d "$SIGNING_SECRET_DIR" && ! -L "$SIGNING_SECRET_DIR" ]] && rm -rf -- "$SIGNING_SECRET_DIR"
+    ;;
+  esac
+}
 
 print_header "Sign Packages"
 
@@ -45,6 +57,18 @@ print_info "Target architecture: $ARCH"
 print_info "Mirror: $MIRROR"
 print_info "Build output: $BUILD_OUTPUT_DIR"
 
+# Validate the complete signing contract before changing build-output. Accept
+# hexadecimal input case-insensitively, but pass a canonical fingerprint to the
+# isolated temporary GPG home.
+validate_signing_secret_pair || exit 1
+
+if [[ ! "${OMARCHY_PKGS_SIGNING_KEY_FINGERPRINT:-}" =~ ^[[:xdigit:]]{40}$ ]]; then
+  print_error "OMARCHY_PKGS_SIGNING_KEY_FINGERPRINT must be a full 40-character hexadecimal fingerprint"
+  exit 1
+fi
+
+OMARCHY_PKGS_SIGNING_KEY_FINGERPRINT=$(printf '%s' "$OMARCHY_PKGS_SIGNING_KEY_FINGERPRINT" | tr '[:lower:]' '[:upper:]')
+
 # Check if build output exists
 if [[ ! -d "$BUILD_OUTPUT_DIR" ]]; then
   print_error "Build output directory not found: $BUILD_OUTPUT_DIR"
@@ -52,37 +76,36 @@ if [[ ! -d "$BUILD_OUTPUT_DIR" ]]; then
   exit 1
 fi
 
-# Check Docker is available
-check_docker
-
-# Check GPG credentials are in environment
-if [[ -z "$GPG_PRIVATE_KEY" ]]; then
-  print_error "GPG_PRIVATE_KEY environment variable not set"
+# Snapshot the owner-only inputs before signing so a later path replacement
+# cannot change the key or passphrase mid-run. Secret bytes never enter an
+# environment variable or Docker metadata.
+SIGNING_SECRET_BASE=${TMPDIR:-/tmp}
+SIGNING_SECRET_BASE=${SIGNING_SECRET_BASE%/}
+if [[ $SIGNING_SECRET_BASE != /* || ! -d $SIGNING_SECRET_BASE || $SIGNING_SECRET_BASE == *:* ]]; then
+  print_error "TMPDIR must be an existing absolute path without ':'"
   exit 1
 fi
-
-if [[ -z "$GPG_PASSPHRASE" ]]; then
-  print_error "GPG_PASSPHRASE environment variable not set"
-  exit 1
-fi
-
-# Build/update the Docker image (always use x86_64 for signing - it's architecture independent)
-build_docker_image "$BUILD_DIR" "x86_64" "$MIRROR"
+SIGNING_SECRET_DIR=$(mktemp -d "$SIGNING_SECRET_BASE/gomarchy-sign.XXXXXX")
+chmod 0700 "$SIGNING_SECRET_DIR"
+trap cleanup_signing_secrets EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+install -m 0600 "$OMARCHY_PKGS_SIGNING_PRIVATE_KEY_FILE" \
+  "$SIGNING_SECRET_DIR/private-key.asc"
+install -m 0600 "$OMARCHY_PKGS_SIGNING_PASSPHRASE_FILE" \
+  "$SIGNING_SECRET_DIR/passphrase"
+unset OMARCHY_PKGS_SIGNING_PRIVATE_KEY_FILE OMARCHY_PKGS_SIGNING_PASSPHRASE_FILE
 
 print_info "Running package signing..."
 
-# Ensure output directory is writable by container user
-make_dir_writable "$BUILD_OUTPUT_DIR"
-
-# Run the signing script in Docker (always use x86_64 image)
-docker run --rm --platform linux/amd64 \
-  -e ARCH="$ARCH" \
-  -e MIRROR="$MIRROR" \
-  -e GPG_PRIVATE_KEY="$GPG_PRIVATE_KEY" \
-  -e GPG_PASSPHRASE="$GPG_PASSPHRASE" \
-  -v "$BUILD_ROOT/build-output:/build-output" \
-  -v "$BUILD_DIR:/build:ro" \
-  omarchy-pkg-builder:latest-x86_64-$MIRROR /build/sign.sh
+ARCH="$ARCH" \
+  MIRROR="$MIRROR" \
+  BUILD_OUTPUT_DIR="$BUILD_OUTPUT_DIR" \
+  GPG_PRIVATE_KEY_FILE="$SIGNING_SECRET_DIR/private-key.asc" \
+  GPG_PASSPHRASE_FILE="$SIGNING_SECRET_DIR/passphrase" \
+  OMARCHY_PKGS_SIGNING_KEY_FINGERPRINT="$OMARCHY_PKGS_SIGNING_KEY_FINGERPRINT" \
+  "$BUILD_DIR/sign.sh"
 
 SIGN_RESULT=$?
 

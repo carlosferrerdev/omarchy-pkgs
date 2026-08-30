@@ -14,15 +14,33 @@ on:
 jobs:
   sync:
     runs-on: ubuntu-latest
+    env:
+      OMARCHY_PKGS_DB_BASE: ${{ vars.OMARCHY_PKGS_DB_BASE }}
+      OMARCHY_PKGS_TRUST_KEY_FINGERPRINT: ${{ vars.OMARCHY_PKGS_TRUST_KEY_FINGERPRINT }}
+      OMARCHY_PKGS_SIGNING_KEY_FINGERPRINT: ${{ vars.OMARCHY_PKGS_SIGNING_KEY_FINGERPRINT }}
     permissions:
       contents: write
       pull-requests: write
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           persist-credentials: false
+
+      - name: Materialize repository verification key
+        env:
+          GOMARCHY_PKGS_SIGNING_PUBLIC_KEY_B64: ${{ secrets.GOMARCHY_PKGS_SIGNING_PUBLIC_KEY_B64 }}
+        run: |
+          set -euo pipefail
+          [[ -n "$GOMARCHY_PKGS_SIGNING_PUBLIC_KEY_B64" ]] || {
+            echo "Missing release secret GOMARCHY_PKGS_SIGNING_PUBLIC_KEY_B64" >&2
+            exit 1
+          }
+          key_file="$RUNNER_TEMP/gomarchy-packages.gpg"
+          install -m 0600 /dev/null "$key_file"
+          printf '%s' "$GOMARCHY_PKGS_SIGNING_PUBLIC_KEY_B64" | base64 --decode >"$key_file"
+          printf 'OMARCHY_PKGS_SIGNING_PUBLIC_KEY_FILE=%s\n' "$key_file" >>"$GITHUB_ENV"
 
       # Runs in an Arch container against the mirror the x86_64 builder itself
       # uses, because the question being asked is what that builder will link
@@ -35,15 +53,20 @@ jobs:
             -e PACKAGES="$PACKAGES" \
             -e HOST_UID="$(id -u)" \
             -e HOST_GID="$(id -g)" \
+            -e OMARCHY_PKGS_DB_BASE \
+            -e OMARCHY_PKGS_TRUST_KEY_FINGERPRINT \
+            -e OMARCHY_PKGS_SIGNING_KEY_FINGERPRINT \
+            -e OMARCHY_PKGS_SIGNING_PUBLIC_KEY_FILE=/run/gomarchy-packages.gpg \
+            -v "$OMARCHY_PKGS_SIGNING_PUBLIC_KEY_FILE:/run/gomarchy-packages.gpg:ro" \
             -v "$PWD/bin:/workspace/bin:ro" \
             -v "$PWD/helpers:/workspace/helpers:ro" \
             -v "$PWD/pkgbuilds:/workspace/pkgbuilds" \
             -w /workspace \
-            archlinux:base-devel bash -lc '
+            docker.io/archlinux/archlinux:base-20260829.0.582217@sha256:6909c68015469764a98ba84eb5d73a3eb8d92e39b0ee9a21ac35f1dc4746d97b bash -lc '
               set -euo pipefail
 
-              printf "Server = https://mirror.omarchy.org/\$repo/os/\$arch\n" > /etc/pacman.d/mirrorlist
-              pacman -Syu --noconfirm jq
+              printf "Server = https://geo.mirror.pkgbuild.com/\$repo/os/\$arch\n" > /etc/pacman.d/mirrorlist
+              pacman -Syu --noconfirm base-devel jq
 
               groupadd -g "$HOST_GID" runner
               useradd -m -u "$HOST_UID" -g "$HOST_GID" runner
@@ -70,7 +93,7 @@ jobs:
 
       - name: Create Pull Request
         if: steps.changes.outputs.has_changes == 'true'
-        uses: peter-evans/create-pull-request@v7
+        uses: peter-evans/create-pull-request@22a9089034f40e5a961c8808d113e2c98fb63676 # v7
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
           commit-message: 'chore: rebuild against updated dependencies'
@@ -87,13 +110,14 @@ jobs:
           branch: auto/sync-rebuilds
           delete-branch: true
           labels: automated
-          reviewers: ryanrhughes
+          reviewers: ${{ vars.GOMARCHY_AUTOMATION_REVIEWERS }}
 
       - name: Notify Basecamp on failure
-        if: failure() && env.BASECAMP_CHATBOT_URL != ''
+        if: failure()
         env:
           BASECAMP_CHATBOT_URL: ${{ secrets.BASECAMP_CHATBOT_URL }}
         run: |
+          [[ -n "$BASECAMP_CHATBOT_URL" ]] || exit 0
           curl -s -o /dev/null \
             -H "Content-Type: application/json" \
             -d "$(jq -n --arg content \

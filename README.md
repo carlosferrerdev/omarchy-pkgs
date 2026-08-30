@@ -184,25 +184,31 @@ bin/repo build --dry-run                         # Show what would build
 
 **Output**: Unsigned `.pkg.tar.zst` in `build-output/`. Only builds packages that are newer than what is in the repository.
 
-Use `--dry-run` to show the build plan without running `makepkg`.
+Use `--dry-run` to show the build plan without running `makepkg`. Because `PKGBUILD` files are executable shell even when their metadata is inspected, the planning pass also runs inside the builder container with only read-only project mounts.
 
 ### Sign
 
 ```bash
+export OMARCHY_PKGS_SIGNING_PRIVATE_KEY_FILE=/absolute/path/to/private-key.asc
+export OMARCHY_PKGS_SIGNING_PASSPHRASE_FILE=/absolute/path/to/passphrase
+export OMARCHY_PKGS_SIGNING_KEY_FINGERPRINT='<full-40-hex-signing-fingerprint>'
 bin/repo sign
 ```
 
-Fetches GPG key from 1Password or environment, signs all packages in `build-output/`. Supports `--arch` and `--mirror`.
+Imports the supplied private material into a temporary GPG home, selects only the configured full primary-key or signing-subkey fingerprint, and verifies each detached signature before keeping it in `build-output/`. Both secret files must be non-empty, owned by the invoking user, and inaccessible to group/other (for example mode `0600`). The wrapper signs on the host from an ephemeral owner-only snapshot; secret bytes never enter the release environment or Docker metadata. Supports `--arch` and `--mirror`.
 
 ### Promote
 
 ```bash
+export OMARCHY_PKGS_SIGNING_PUBLIC_KEY_FILE=/absolute/path/to/versioned-signing-key.asc
+export OMARCHY_PKGS_TRUST_KEY_FINGERPRINT='<full-40-hex-primary-fingerprint>'
+export OMARCHY_PKGS_SIGNING_KEY_FINGERPRINT='<full-40-hex-signing-fingerprint>'
 bin/repo promote                    # Copy to production
 bin/repo promote --arch aarch64     # ARM64
 bin/repo promote --dry-run          # Preview
 ```
 
-Copies signed packages from `build-output/` → `pkgs.omarchy.org/`.
+Before creating the destination or moving anything, imports exactly one public key from the absolute, regular, non-symlink file, requires its primary fingerprint to equal the configured trust root, and verifies every package signature against the exact signing primary/subkey fingerprint. `--dry-run` only reads the build plan, so it intentionally does not require trust inputs. Keeping these fingerprints separate lets an operator rotate a signing subkey without silently changing the primary trust root distributed to clients. Run `test/signing-trust-test.sh` for the disposable-key signing and promotion regression suite.
 
 ### Clean
 
@@ -395,9 +401,9 @@ The bump is the point of the command, and it has to land in git rather than in t
 
 For an AUR-synced package the bump is expressed as the dotted Omarchy pkgrel suffix in the metadata as well as in the PKGBUILD, because the next AUR sync replaces the PKGBUILD wholesale and would otherwise drop it.
 
-The bumped version is checked against the published one as well as the checked-in one, and refused when pacman would not order it higher. The checked-in version is not the floor; what a user already has is, and a checkout that has fallen behind the repository can otherwise be bumped to something that loses to the package it means to replace. That check is skipped with a warning when the published database cannot be read.
+The bumped version is checked against the published one as well as the checked-in one, and refused when pacman would not order it higher. The checked-in version is not the floor; what a user already has is, and a checkout that has fallen behind the repository can otherwise be bumped to something that loses to the package it means to replace. The published-version floor comes only from the explicitly configured Gomarchy database after its detached signature is verified against both the configured trust root and exact signer; an unavailable or invalid database blocks the run and leaves package metadata unchanged.
 
-Versions are read from the local pacman database, so this runs on Arch or in an Arch container against a synced database. Only `core`, `extra` and `multilib` count: a Qt release sitting in testing or kde-unstable is not what the builder will link against, and rebuilding for it would ship a package built against the wrong ABI. The workflow points that database at `mirror.omarchy.org`, the mirror the x86_64 builder itself uses, because a mirror running ahead of the builder would record a version the build never linked against and nothing re-fires once the record matches.
+Versions are read from the local pacman database, so this runs on Arch or in an Arch container against a synced database. Only `core`, `extra` and `multilib` count: a Qt release sitting in testing or kde-unstable is not what the builder will link against, and rebuilding for it would ship a package built against the wrong ABI. The workflow uses Arch's official geo mirror, matching the x86_64 builder's repository source so a different mirror cannot record a version the build never linked against and suppress the next rebuild.
 
 aarch64 is not covered. Those builds resolve Qt from Arch Linux ARM, which can lag Arch, so one record cannot describe both architectures. Only x86_64 is published today, so nothing currently ships from the untracked side; if ARM publishing starts, `rebuilt_against` has to become per-architecture before this can be trusted there.
 
@@ -708,14 +714,20 @@ bin/repo release --package my-package
 ## Architecture-Specific Notes
 
 ### x86_64
+
 - Native builds (fast)
-- Mirrors: mirror.omarchy.org, rackspace, pkgbuild.com
+- Official Arch geo mirror (`geo.mirror.pkgbuild.com`)
 
 ### aarch64
+
 - QEMU emulation required on x86_64 hosts (slower)
 - Uses Arch Linux ARM repositories
 - Additional repos: `[alarm]`, `[aur]`
 - Same workflow, just add `--arch aarch64`
+
+### Apple T2 package closure
+
+The signed Gomarchy channel must carry `apple-t2-audio-config`, `linux-t2`, `linux-t2-headers`, `t2fanrd`, and `apple-bcm-firmware` before an ISO can claim the complete T2 platform closure. This repository builds the first four from pinned, checksummed, redistributable sources. It deliberately does not create an `apple-bcm-firmware` package: the available upstream recipe labels the proprietary firmware license unknown and downloads mutable blobs without integrity hashes. `policy/t2-packages.json` records the boundary, and tests fail closed until firmware is supplied by the machine owner from their macOS installation or explicit redistribution terms plus an immutable checksummed source are available.
 
 ### Building for Both Architectures
 
@@ -865,23 +877,16 @@ state directory, and installs and enables the release timers. It works on
 Debian/Ubuntu and on Arch, and is idempotent, so run it again whenever a
 dependency is added.
 
-The host does not need to be Arch: makepkg, repo-add and package signing all
-run inside containers, so it needs only Docker, rclone, bsdtar, jq, git and
-rsync. Docker is left alone when it already works, rather than replacing a
-working installation from Docker's own repository with the distribution's.
+The host does not need to be Arch: makepkg and repo-add run inside containers. Signing and signature verification run directly on the release host with an isolated GnuPG home, so the host needs Docker, GnuPG, rclone, bsdtar, jq, git and rsync. Docker is left alone when it already works, rather than replacing a working installation from Docker's own repository with the distribution's.
 
 ```bash
 bin/repo setup --check         # Report what is missing, change nothing
 bin/repo setup --skip-timers   # Prepare the host without the release timers
 ```
 
-Signing credentials (`/root/.omarchy/build-credentials`) and the rclone remote
-hold secrets, so setup reports on them rather than creating them. The same file
-must export `OMARCHY_PKGS_RCLONE_DEST`; `bin/repo release`, `advance`, `sync`,
-and `upload-prebuilt` validate the configured remote before lock, build,
-signing, or promotion. Variables must use `export`, because timers and SSH
-forwarding run child processes. An explicit `--remote` remains available for
-deliberate one-off destinations.
+Signing credentials (`/root/.omarchy/build-credentials`) and the rclone remote hold secrets, so setup reports on them rather than creating them. The same file must export the paths `OMARCHY_PKGS_SIGNING_PRIVATE_KEY_FILE` and `OMARCHY_PKGS_SIGNING_PASSPHRASE_FILE`, the full 40-hex `OMARCHY_PKGS_SIGNING_KEY_FINGERPRINT`, the full 40-hex primary `OMARCHY_PKGS_TRUST_KEY_FINGERPRINT`, the absolute regular `OMARCHY_PKGS_SIGNING_PUBLIC_KEY_FILE`, the explicit Gomarchy-owned HTTPS `OMARCHY_PKGS_DB_BASE`, and `OMARCHY_PKGS_RCLONE_DEST`. Both secret files must be owned by the release user and inaccessible to group/other (for example mode `0600`). Inline `GPG_PRIVATE_KEY` and `GPG_PASSPHRASE` values are retired and stripped by release entrypoints. The signer validates its private-key contract before changing build artifacts; promotion validates the public key and every signature before touching the published tree. Variables must use `export`, because timers and SSH forwarding run child processes. An explicit `--remote` remains available for deliberate one-off destinations.
+
+Release status and rebuild automation never infer state from an unsigned network response. They download the matching detached signature for each repository database, validate the configured primary trust root and exact signer from the public-key file, and only then read published package versions. An unavailable or invalid signature blocks release decisions and automated pkgrel bumps. Manual publication also compares the signed database records with the complete local package inventory before its first remote operation, so an interrupted activation cannot publish an authenticated but incomplete index.
 
 ### Management
 

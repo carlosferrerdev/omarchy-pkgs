@@ -5,6 +5,8 @@ BUILD_ROOT=$(realpath "${BASH_SOURCE[0]%/*}/..")
 source "$BUILD_ROOT/helpers/message-helpers.sh"
 source "$BUILD_ROOT/helpers/paths.sh"
 source "$BUILD_ROOT/helpers/package-metadata.sh"
+source "$BUILD_ROOT/helpers/trust-helpers.sh"
+source "$BUILD_ROOT/helpers/repository-signature-helpers.sh"
 
 TEMP_DIR=$(mktemp -d)
 trap 'rm -rf "$TEMP_DIR"' EXIT
@@ -19,9 +21,12 @@ OFFICIAL_REPOS=" core extra multilib core-debug extra-debug "
 
 # The published repository, used as the floor a bumped pkgrel has to clear.
 # Only x86_64 is published today; aarch64 has no repository to compare against.
-PUBLISHED_BASE_URL="${OMARCHY_PUBLISHED_BASE_URL:-https://pkgs.omarchy.org}"
+PUBLISHED_BASE_URL="${OMARCHY_PKGS_DB_BASE:-}"
 PUBLISHED_MIRRORS=(edge stable)
 PUBLISHED_ARCH=x86_64
+PUBLISHED_VERIFY_HOME="$TEMP_DIR/published-gnupg"
+PUBLISHED_SIGNING_FINGERPRINT=""
+PUBLISHED_VERIFICATION_READY=false
 
 usage() {
   cat <<EOF
@@ -112,6 +117,21 @@ declare -A PUBLISHED_VERSION=()
 PUBLISHED_LOADED=false
 PUBLISHED_AVAILABLE=true
 
+prepare_published_verification() {
+  [[ $PUBLISHED_VERIFICATION_READY == true ]] && return 0
+
+  validate_pkgs_db_base "$PUBLISHED_BASE_URL" || return 1
+  PUBLISHED_SIGNING_FINGERPRINT=$(repository_signature_normalize_fingerprint \
+    OMARCHY_PKGS_SIGNING_KEY_FINGERPRINT \
+    "${OMARCHY_PKGS_SIGNING_KEY_FINGERPRINT:-}") || return 1
+  mkdir -m 0700 "$PUBLISHED_VERIFY_HOME"
+  repository_signature_prepare_keyring "$PUBLISHED_VERIFY_HOME" \
+    "${OMARCHY_PKGS_SIGNING_PUBLIC_KEY_FILE:-}" \
+    "${OMARCHY_PKGS_TRUST_KEY_FINGERPRINT:-}" \
+    "$PUBLISHED_SIGNING_FINGERPRINT" || return 1
+  PUBLISHED_VERIFICATION_READY=true
+}
+
 remember_published() {
   local name="$1"
   local version="$2"
@@ -131,16 +151,35 @@ load_published_versions() {
   [[ "$PUBLISHED_LOADED" == true ]] && return 0
   PUBLISHED_LOADED=true
 
-  local mirror db name base version
+  local mirror db signature name base version
+
+  if ! prepare_published_verification; then
+    print_error "Could not establish the signed Gomarchy package repository trust contract"
+    PUBLISHED_AVAILABLE=false
+    return 1
+  fi
 
   for mirror in "${PUBLISHED_MIRRORS[@]}"; do
     db="$TEMP_DIR/published-$mirror.db.tar.zst"
+    signature="$db.sig"
 
     if ! curl -fsSL --max-time 120 -o "$db" \
       "$PUBLISHED_BASE_URL/$mirror/$PUBLISHED_ARCH/omarchy.db.tar.zst" 2>/dev/null; then
-      print_warning "Could not read the published $mirror database; bumps are not checked against it this run"
+      print_error "Could not read the published $mirror database"
       PUBLISHED_AVAILABLE=false
-      continue
+      return 1
+    fi
+    if ! curl -fsSL --max-time 120 -o "$signature" \
+      "$PUBLISHED_BASE_URL/$mirror/$PUBLISHED_ARCH/omarchy.db.tar.zst.sig" 2>/dev/null; then
+      print_error "Could not read the published $mirror database signature"
+      PUBLISHED_AVAILABLE=false
+      return 1
+    fi
+    if ! repository_signature_verify_exact "$PUBLISHED_VERIFY_HOME" \
+      "$PUBLISHED_SIGNING_FINGERPRINT" "$db" "$signature"; then
+      print_error "Published $mirror database has an invalid or unexpected signature"
+      PUBLISHED_AVAILABLE=false
+      return 1
     fi
 
     while IFS=$'\t' read -r name base version; do
@@ -165,7 +204,7 @@ load_published_versions() {
 published_version() {
   local package="$1"
 
-  load_published_versions
+  load_published_versions || return 1
   echo "${PUBLISHED_VERSION[$package]:-}"
 }
 
@@ -384,7 +423,11 @@ sync_package() {
   # checkout that has fallen behind the repository can otherwise be bumped to
   # something pacman orders below what it would replace.
   local floor
-  floor=$(published_version "$package")
+  if ! floor=$(published_version "$package"); then
+    print_error "  Could not establish the signed published version floor; leaving $package alone"
+    ((++FAILED))
+    return 0
+  fi
   if [[ -n "$floor" && "$(version_pkgver "$floor")" == "$pkgver" ]]; then
     if [[ "$(vercmp "$new_version" "$floor")" -le 0 ]]; then
       print_error "  $new_version would not be an upgrade over the published $floor; leaving $package alone"
@@ -498,31 +541,38 @@ selftest_published() {
   local staging="$root/stub/db"
   local entry name version
 
-  if [[ $# -gt 0 ]]; then
-    rm -rf "$staging"
-    mkdir -p "$staging"
-    for entry in "$@"; do
-      name="${entry%=*}"
-      version="${entry#*=}"
-      mkdir -p "$staging/$name-$version"
-      printf '%%FILENAME%%\n%s-%s-x86_64.pkg.tar.zst\n\n%%NAME%%\n%s\n\n%%BASE%%\n%s\n\n%%VERSION%%\n%s\n' \
-        "$name" "$version" "$name" "$name" "$version" > "$staging/$name-$version/desc"
-    done
-    tar --zstd -cf "$root/stub/omarchy.db.tar.zst" -C "$staging" .
-  fi
+  rm -rf "$staging"
+  mkdir -p "$staging"
+  for entry in "$@"; do
+    name="${entry%=*}"
+    version="${entry#*=}"
+    mkdir -p "$staging/$name-$version"
+    printf '%%FILENAME%%\n%s-%s-x86_64.pkg.tar.zst\n\n%%NAME%%\n%s\n\n%%BASE%%\n%s\n\n%%VERSION%%\n%s\n' \
+      "$name" "$version" "$name" "$name" "$version" > "$staging/$name-$version/desc"
+  done
+  tar --zstd -cf "$root/stub/omarchy.db.tar.zst" -C "$staging" .
+  gpg --batch --yes --no-options --homedir "$SELFTEST_SIGNING_HOME" \
+    --local-user "$SELFTEST_SIGNING_FINGERPRINT!" --detach-sign \
+    --output "$root/stub/omarchy.db.tar.zst.sig" \
+    "$root/stub/omarchy.db.tar.zst"
 
   cat > "$root/stub/curl" <<'STUB'
 #!/bin/bash
 out=""
+url=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     -o) out="$2"; shift 2 ;;
+    http://*|https://*) url="$1"; shift ;;
     *) shift ;;
   esac
 done
-db="$(dirname "$0")/omarchy.db.tar.zst"
-[[ -f "$db" && -n "$out" ]] || exit 22
-cp "$db" "$out"
+case "$url" in
+  *.sig) source_file="$(dirname "$0")/omarchy.db.tar.zst.sig" ;;
+  *) source_file="$(dirname "$0")/omarchy.db.tar.zst" ;;
+esac
+[[ -f "$source_file" && -n "$out" ]] || exit 22
+cp "$source_file" "$out"
 STUB
   chmod +x "$root/stub/curl"
 }
@@ -545,7 +595,12 @@ cmd_self_test() {
     local root="$1"
     shift
     local status=0
-    PATH="$root/stub:$PATH" "$root/bin/sync-rebuilds" "$@" > "$root/output" 2>&1 || status=$?
+    PATH="$root/stub:$PATH" \
+      OMARCHY_PKGS_DB_BASE=https://packages.gomarchy.invalid \
+      OMARCHY_PKGS_TRUST_KEY_FINGERPRINT="$SELFTEST_SIGNING_FINGERPRINT" \
+      OMARCHY_PKGS_SIGNING_KEY_FINGERPRINT="$SELFTEST_SIGNING_FINGERPRINT" \
+      OMARCHY_PKGS_SIGNING_PUBLIC_KEY_FILE="$SELFTEST_SIGNING_PUBLIC_KEY" \
+      "$root/bin/sync-rebuilds" "$@" > "$root/output" 2>&1 || status=$?
     echo "$status"
   }
 
@@ -554,6 +609,22 @@ cmd_self_test() {
   }
 
   print_header "sync-rebuilds self-test"
+
+  SELFTEST_SIGNING_HOME="$TEMP_DIR/selftest-signing-gnupg"
+  SELFTEST_SIGNING_PUBLIC_KEY="$TEMP_DIR/selftest-signing-public.gpg"
+  mkdir -m 0700 "$SELFTEST_SIGNING_HOME"
+  gpg --batch --no-options --homedir "$SELFTEST_SIGNING_HOME" --passphrase '' \
+    --quick-generate-key 'Gomarchy Rebuild Self-Test <rebuild-test@gomarchy.invalid>' \
+    ed25519 sign 0 >/dev/null 2>&1
+  SELFTEST_SIGNING_FINGERPRINT=$(gpg --batch --no-options --homedir "$SELFTEST_SIGNING_HOME" \
+    --with-colons --fingerprint --list-secret-keys | \
+    awk -F: '$1 == "sec" { primary = 1; next } primary && $1 == "fpr" { print toupper($10); exit }')
+  gpg --batch --no-options --homedir "$SELFTEST_SIGNING_HOME" \
+    --export "$SELFTEST_SIGNING_FINGERPRINT" > "$SELFTEST_SIGNING_PUBLIC_KEY"
+  [[ -s $SELFTEST_SIGNING_PUBLIC_KEY ]] || {
+    print_error "Could not create the disposable repository signing fixture"
+    return 1
+  }
 
   echo "A trigger missing from the record counts as changed:"
   root=$(selftest_root partial)
@@ -626,7 +697,7 @@ if [[ "$SELF_TEST" == true ]]; then
   exit $?
 fi
 
-for tool in pacman vercmp jq curl; do
+for tool in pacman vercmp jq curl gpg; do
   if ! command -v "$tool" >/dev/null 2>&1; then
     print_error "$tool not found: reading trigger versions and ordering pkgrels both need pacman"
     exit 1
