@@ -13,21 +13,16 @@ check_docker() {
   fi
 }
 
-setup_qemu() {
-  # Setup QEMU for building ARM64 packages on x86_64 hosts
-  if ! docker run --rm --privileged multiarch/qemu-user-static --reset -p yes --credential yes >/dev/null 2>&1; then
-    print_error "Failed to setup QEMU for ARM64 emulation"
-    exit 1
-  fi
-  print_success "QEMU ARM64 emulation enabled"
-}
-
 build_docker_image() {
   local build_dir="$1"
   local arch="${2:-x86_64}"
   local mirror="${3:-edge}"
   local platform=""
   local image_tag="omarchy-pkg-builder:latest-$arch-$mirror"
+  local builder_uid
+
+  builder_uid=$(id -u)
+  [[ $builder_uid -ne 0 ]] || builder_uid=1000
 
   
   case "$arch" in
@@ -43,6 +38,7 @@ build_docker_image() {
   
   docker buildx build \
     --platform "$platform" \
+    --build-arg BUILDER_UID="$builder_uid" \
     --build-arg MIRROR="$mirror" \
     --load \
     -t "$image_tag" \
@@ -61,9 +57,17 @@ get_platform_arg() {
 
 make_dir_writable() {
   local dir="$1"
-  if [ "$(id -u)" -eq 0 ]; then
-    chmod -R 777 "$dir"
-  else
-    sudo chown -R $(id -u):$(id -g) "$dir" 2>/dev/null || chmod -R 777 "$dir"
+  local builder_uid
+
+  [[ -d $dir && ! -L $dir ]] || {
+    print_error "Writable Docker path is missing or unsafe: $dir"
+    return 1
+  }
+  builder_uid=$(id -u)
+  [[ $builder_uid -ne 0 ]] || builder_uid=1000
+
+  if [[ $(id -u) -eq 0 ]]; then
+    chown -R "$builder_uid:$builder_uid" "$dir"
   fi
+  chmod -R u+rwX,go-w "$dir"
 }

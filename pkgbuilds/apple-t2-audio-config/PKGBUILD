@@ -1,0 +1,41 @@
+# Maintainer: Gomarchy maintainers
+
+pkgname=apple-t2-audio-config
+pkgver=0.3
+pkgrel=3
+pkgdesc='PipeWire and PulseAudio profiles for Apple T2 audio devices'
+arch=(any)
+url='https://github.com/kekrby/t2-better-audio'
+license=(MIT)
+replaces=(apple-t2-audio-config-alt)
+optdepends=(
+  'linux-t2: T2 audio kernel driver'
+  'pipewire-audio: recommended audio server'
+  'pulseaudio: alternative audio server'
+)
+
+_commit=e46839a28963e2f7d364020518b9dac98236bcae
+_archive="t2-better-audio-$_commit"
+source=(
+  "$pkgname-$_commit.tar.gz::https://codeload.github.com/kekrby/t2-better-audio/tar.gz/$_commit"
+)
+sha256sums=(
+  0f40d60c7116748cdc93784545b866dec9422afb2db2b337c7ede00b735a80ea
+)
+
+package() {
+  local mixer_root
+
+  for mixer_root in \
+    usr/share/alsa-card-profile/mixer \
+    usr/share/pulseaudio/alsa-mixer; do
+    install -d "$pkgdir/$mixer_root"
+    cp -a "$srcdir/$_archive/files/profile-sets" "$pkgdir/$mixer_root/"
+    cp -a "$srcdir/$_archive/files/paths" "$pkgdir/$mixer_root/"
+  done
+
+  install -Dm644 "$srcdir/$_archive/files/91-audio-custom.rules" \
+    "$pkgdir/usr/lib/udev/rules.d/92-apple-t2-audio.rules"
+  install -Dm644 "$srcdir/$_archive/LICENSE" \
+    "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+}

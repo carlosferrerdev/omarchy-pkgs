@@ -3,6 +3,8 @@
 
 set -e
 
+unset GPG_PRIVATE_KEY GPG_PASSPHRASE
+
 BUILD_ROOT=$(realpath "${BASH_SOURCE[0]%/*}/..")
 source "$BUILD_ROOT/helpers/message-helpers.sh"
 source "$BUILD_ROOT/helpers/paths.sh"

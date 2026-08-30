@@ -1,0 +1,17 @@
+[Unit]
+Description=Fan control for Apple T2 Macs
+Documentation=https://github.com/GnomedDev/T2FanRD
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/t2fanrd
+Restart=on-failure
+RestartSec=2s
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectHome=yes
+LockPersonality=yes
+RestrictSUIDSGID=yes
+
+[Install]
+WantedBy=multi-user.target

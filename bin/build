@@ -3,13 +3,17 @@
 # Abort if anything fails
 set -e
 
+unset GPG_PRIVATE_KEY GPG_PASSPHRASE
+
 # Source common functions
 BUILD_ROOT=$(realpath "${BASH_SOURCE[0]%/*}/..")
 source "$BUILD_ROOT/helpers/message-helpers.sh"
 source "$BUILD_ROOT/helpers/docker-helpers.sh"
 source "$BUILD_ROOT/helpers/paths.sh"
+source "$BUILD_ROOT/helpers/package-metadata.sh"
+source "$BUILD_ROOT/helpers/trust-helpers.sh"
 
-print_header "Omarchy Package Builder"
+print_header "Gomarchy Package Builder"
 
 DRY_RUN=false
 
@@ -83,21 +87,104 @@ print_info "Build workspace: $BUILD_OUTPUT_DIR"
 print_info "Final output: $REPO_DIR"
 
 if [[ "$DRY_RUN" == true ]]; then
-  print_warning "DRY RUN MODE - build plan only; no Docker or makepkg will run"
-  ARCH="$ARCH" \
-    MIRROR="$MIRROR" \
-    PACKAGES="$PACKAGES" \
-    DRY_RUN=true \
-    PKGBUILDS_DIR="$PKGBUILDS_DIR" \
-    BUILD_OUTPUT_DIR="$BUILD_OUTPUT_DIR" \
-    FINAL_OUTPUT_DIR="$REPO_DIR" \
-    HELPERS_DIR="$BUILD_ROOT/helpers" \
-    SRC_DIR="$SRC_DIR" \
-    "$BUILD_ROOT/build/build.sh"
-  exit $?
+  print_warning "DRY RUN MODE - build plan only; makepkg will not run"
+
+  # PKGBUILDs are executable shell, including while their metadata and
+  # dependency arrays are inspected. Keep the read-only planning pass inside
+  # the builder container too; a preview must never evaluate package recipes
+  # directly on the release host.
+  check_docker
+  build_docker_image "$BUILD_DIR" "$ARCH" "$MIRROR"
+
+  DRY_RUN_CONTAINER_ID=""
+  cleanup_dry_run_container() {
+    [[ -z $DRY_RUN_CONTAINER_ID ]] || docker rm -f "$DRY_RUN_CONTAINER_ID" >/dev/null 2>&1 || true
+  }
+  trap cleanup_dry_run_container EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+
+  DRY_RUN_IMAGE_TAG="omarchy-pkg-builder:latest-$ARCH-$MIRROR"
+  DRY_RUN_PLATFORM_ARG=$(get_platform_arg "$ARCH")
+  DRY_RUN_CONTAINER_ID=$(docker create $DRY_RUN_PLATFORM_ARG \
+    -e ARCH="$ARCH" \
+    -e MIRROR="$MIRROR" \
+    -e PACKAGES="$PACKAGES" \
+    -e DRY_RUN=true \
+    -v "$REPO_ROOT:/pkgs.omarchy.org:ro" \
+    -v "$BUILD_DIR:/build:ro" \
+    -v "$BUILD_ROOT/helpers:/helpers:ro" \
+    -v "$PKGBUILDS_DIR:/pkgbuilds:ro" \
+    "$DRY_RUN_IMAGE_TAG" /build/build.sh)
+  if ! docker start -a "$DRY_RUN_CONTAINER_ID"; then
+    print_error "Could not resolve the isolated build plan"
+    exit 1
+  fi
+  docker rm "$DRY_RUN_CONTAINER_ID" >/dev/null
+  DRY_RUN_CONTAINER_ID=""
+  trap - EXIT INT TERM
+  exit 0
 fi
 
-# Create directories if they don't exist
+# Validate the complete trust contract before Docker, output-directory creation,
+# or any other build mutation. The public bundle may include signing subkeys,
+# but its only primary key must be the configured long-lived trust root.
+PKGS_DB_BASE="${OMARCHY_PKGS_DB_BASE:-}"
+TRUST_FINGERPRINT=$(normalize_trust_fingerprint "${OMARCHY_PKGS_TRUST_KEY_FINGERPRINT:-}") || exit 1
+SIGNING_PUBLIC_KEY_FILE="${OMARCHY_PKGS_SIGNING_PUBLIC_KEY_FILE:-}"
+validate_pkgs_db_base "$PKGS_DB_BASE" || exit 1
+inspect_trust_public_key "$SIGNING_PUBLIC_KEY_FILE" "$TRUST_FINGERPRINT" || exit 1
+
+TRUST_TMP_BASE="${TMPDIR:-/tmp}"
+TRUST_TMP_BASE="${TRUST_TMP_BASE%/}"
+if [[ -z "$TRUST_TMP_BASE" || "$TRUST_TMP_BASE" != /* || ! -d "$TRUST_TMP_BASE" || -L "$TRUST_TMP_BASE" ]]; then
+  print_error "TMPDIR must be an existing absolute non-symlink directory"
+  exit 1
+fi
+TRUST_STAGING_DIR=""
+PLAN_CONTAINER_ID=""
+BUILD_CONTAINER_ID=""
+ARTIFACT_STAGING_DIR=""
+BUILD_PLAN_LOCAL=""
+EXPECTED_OUTPUTS_FILE=""
+SEEN_OUTPUTS_FILE=""
+cleanup_trust_staging() {
+  [[ -z $PLAN_CONTAINER_ID ]] || docker rm -f "$PLAN_CONTAINER_ID" >/dev/null 2>&1 || true
+  [[ -z $BUILD_CONTAINER_ID ]] || docker rm -f "$BUILD_CONTAINER_ID" >/dev/null 2>&1 || true
+  case "$TRUST_STAGING_DIR" in
+  "$TRUST_TMP_BASE"/gomarchy-keyring-build.*)
+    [[ -d "$TRUST_STAGING_DIR" && ! -L "$TRUST_STAGING_DIR" ]] && rm -rf -- "$TRUST_STAGING_DIR"
+    ;;
+  esac
+  case "$ARTIFACT_STAGING_DIR" in
+  "$TRUST_TMP_BASE"/gomarchy-build-artifacts.*)
+    [[ -d $ARTIFACT_STAGING_DIR && ! -L $ARTIFACT_STAGING_DIR ]] && rm -rf -- "$ARTIFACT_STAGING_DIR"
+    ;;
+  esac
+  for temporary_file in "$BUILD_PLAN_LOCAL" "$EXPECTED_OUTPUTS_FILE" "$SEEN_OUTPUTS_FILE"; do
+    case "$temporary_file" in
+    "$TRUST_TMP_BASE"/gomarchy-build-*) [[ -z $temporary_file ]] || rm -f -- "$temporary_file" ;;
+    esac
+  done
+}
+trap cleanup_trust_staging EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+TRUST_STAGING_DIR=$(mktemp -d "$TRUST_TMP_BASE/gomarchy-keyring-build.XXXXXX")
+KEYRING_PACKAGE_DIR="$TRUST_STAGING_DIR/omarchy-keyring"
+mkdir "$KEYRING_PACKAGE_DIR"
+cp -a "$PKGBUILDS_DIR/omarchy-keyring/." "$KEYRING_PACKAGE_DIR/"
+
+# Revalidate the exact file after staging to close the path replacement window,
+# then export only the configured primary and its public subkeys.
+cp "$SIGNING_PUBLIC_KEY_FILE" "$TRUST_STAGING_DIR/signing-public-key"
+inspect_trust_public_key "$TRUST_STAGING_DIR/signing-public-key" "$TRUST_FINGERPRINT" || exit 1
+prepare_keyring_inputs "$KEYRING_PACKAGE_DIR" "$PKGS_DB_BASE" "$TRUST_FINGERPRINT" \
+  "$TRUST_STAGING_DIR/signing-public-key" || exit 1
+
+# Create directories if they don't exist. The final repository is mounted into
+# the untrusted package builder only for dependency/version reads.
 mkdir -p "$BUILD_OUTPUT_DIR" "$REPO_DIR" "$SRC_DIR"
 
 # Check Docker is available
@@ -105,10 +192,14 @@ check_docker
 
 # Setup QEMU for aarch64 builds on x86_64 hosts
 if [[ "$(uname -m)" == "x86_64" && "$ARCH" == "aarch64" ]]; then
-  # Check if QEMU is already working
-  if ! docker run --rm --platform linux/arm64 alpine:3.21 /bin/true >/dev/null 2>&1; then
-    print_info "Setting up QEMU for ARM64 emulation..."
-    setup_qemu
+  # Binfmt registration is a host-administration concern. Never grant a mutable
+  # third-party helper image unrestricted host access from a release command.
+  if ! docker run --rm --platform linux/arm64 \
+    docker.io/library/alpine:3.21.7@sha256:48b0309ca019d89d40f670aa1bc06e426dc0931948452e8491e3d65087abc07d \
+    /bin/true >/dev/null 2>&1; then
+    print_error "ARM64 container execution is unavailable"
+    print_warning "Configure binfmt/QEMU through the host's trusted administration path, then retry"
+    exit 1
   fi
 fi
 
@@ -129,35 +220,147 @@ build_docker_image "$BUILD_DIR" "$ARCH" "$MIRROR"
 
 print_info "Running package build..."
 
-# Create output directories if they don't exist
-mkdir -p "$BUILD_OUTPUT_DIR"
-mkdir -p "$REPO_DIR"
-
-# Ensure output directories are writable by container user
-make_dir_writable "$BUILD_OUTPUT_DIR"
-make_dir_writable "$REPO_DIR"
-
 # Build Docker arguments
 DOCKER_ARGS=(
-  --rm
   -e ARCH="$ARCH"
   -e MIRROR="$MIRROR"
   -e PACKAGES="$PACKAGES"
   -e OMARCHY_RC_PINS="${OMARCHY_RC_PINS:-}"
-  -v "$BUILD_ROOT/build-output:/build-output"
-  -v "$REPO_ROOT:/pkgs.omarchy.org"
+  -e OMARCHY_PKGS_DB_BASE="$PKGS_DB_BASE"
+  -e OMARCHY_PKGS_TRUST_KEY_FINGERPRINT="$TRUST_FINGERPRINT"
+  -v "$REPO_ROOT:/pkgs.omarchy.org:ro"
   -v "$BUILD_DIR:/build:ro"
   -v "$BUILD_ROOT/helpers:/helpers:ro"
   -v "$BUILD_ROOT/pkgbuilds:/pkgbuilds:ro"
+  -v "$KEYRING_PACKAGE_DIR:/pkgbuilds/omarchy-keyring:ro"
 )
 
-# Run the builder with assembled args
+# Resolve the exact pkgbase plan in a disposable, host-read-only container.
+# PKGBUILDs may execute shell while makepkg evaluates them, so even planning is
+# kept away from writable host mounts.
 IMAGE_TAG="omarchy-pkg-builder:latest-$ARCH-$MIRROR"
 PLATFORM_ARG=$(get_platform_arg "$ARCH")
+BUILD_PLAN_LOCAL=$(mktemp "$TRUST_TMP_BASE/gomarchy-build-plan.XXXXXX")
+PLAN_CONTAINER_ID=$(docker create $PLATFORM_ARG \
+  "${DOCKER_ARGS[@]}" \
+  -e DRY_RUN=true \
+  -e BUILD_PLAN_FILE=/tmp/gomarchy-build-plan \
+  "$IMAGE_TAG" /build/build.sh)
+if ! docker start -a "$PLAN_CONTAINER_ID"; then
+  print_error "Could not resolve the isolated build plan"
+  exit 1
+fi
+docker cp "$PLAN_CONTAINER_ID:/tmp/gomarchy-build-plan" "$BUILD_PLAN_LOCAL"
+docker rm "$PLAN_CONTAINER_ID" >/dev/null
+PLAN_CONTAINER_ID=""
 
-docker run $PLATFORM_ARG "${DOCKER_ARGS[@]}" "$IMAGE_TAG" /build/build.sh
+if [[ ! -s $BUILD_PLAN_LOCAL ]]; then
+  print_success "All packages are already up to date"
+  exit 0
+fi
 
-BUILD_RESULT=$?
+# Translate the pkgbase plan into the only package identities allowed to leave
+# the build container. Split packages declare this list in metadata.
+EXPECTED_OUTPUTS_FILE=$(mktemp "$TRUST_TMP_BASE/gomarchy-build-expected.XXXXXX")
+while IFS= read -r planned_pkgbase; do
+  [[ $planned_pkgbase =~ ^[A-Za-z0-9@._+:-]+$ ]] || {
+    print_error "Unsafe pkgbase in isolated build plan: $planned_pkgbase"
+    exit 1
+  }
+  planned_dir=$(package_dir_for_name "$planned_pkgbase") || {
+    print_error "Unknown pkgbase in isolated build plan: $planned_pkgbase"
+    exit 1
+  }
+  package_expected_outputs "$planned_dir" >>"$EXPECTED_OUTPUTS_FILE" || {
+    print_error "Invalid declared outputs for pkgbase: $planned_pkgbase"
+    exit 1
+  }
+done <"$BUILD_PLAN_LOCAL"
+duplicate_output=$(sort "$EXPECTED_OUTPUTS_FILE" | uniq -d | head -1)
+if [[ -n $duplicate_output ]]; then
+  print_error "Package output is owned by more than one planned pkgbase: $duplicate_output"
+  exit 1
+fi
+sort -u -o "$EXPECTED_OUTPUTS_FILE" "$EXPECTED_OUTPUTS_FILE"
+
+# Untrusted build code receives no writable host bind. The stopped container is
+# copied to an owner-only staging directory and every artifact is validated on
+# the host before it can enter build-output and later reach the signer.
+BUILD_CONTAINER_ID=$(docker create $PLATFORM_ARG "${DOCKER_ARGS[@]}" \
+  "$IMAGE_TAG" /build/build.sh)
+if ! docker start -a "$BUILD_CONTAINER_ID"; then
+  print_error "Package build failed"
+  exit 1
+fi
+ARTIFACT_STAGING_DIR=$(mktemp -d "$TRUST_TMP_BASE/gomarchy-build-artifacts.XXXXXX")
+chmod 0700 "$ARTIFACT_STAGING_DIR"
+docker cp "$BUILD_CONTAINER_ID:/build-output/$MIRROR/$ARCH/." "$ARTIFACT_STAGING_DIR"
+docker rm "$BUILD_CONTAINER_ID" >/dev/null
+BUILD_CONTAINER_ID=""
+
+command -v bsdtar >/dev/null 2>&1 || {
+  print_error "bsdtar is required to validate built package identities"
+  exit 1
+}
+SEEN_OUTPUTS_FILE=$(mktemp "$TRUST_TMP_BASE/gomarchy-build-seen.XXXXXX")
+shopt -s nullglob dotglob
+for artifact in "$ARTIFACT_STAGING_DIR"/*; do
+  artifact_name=${artifact##*/}
+  case "$artifact_name" in
+  omarchy-build.db | omarchy-build.db.tar.* | omarchy-build.files | omarchy-build.files.tar.*)
+    continue
+    ;;
+  *.pkg.tar.*.sig)
+    print_error "Unsigned build container emitted an unexpected signature: $artifact_name"
+    exit 1
+    ;;
+  *.pkg.tar.*)
+    [[ -f $artifact && ! -L $artifact && -s $artifact ]] || {
+      print_error "Build emitted a missing, empty, non-regular, or symlink package: $artifact_name"
+      exit 1
+    }
+    package_identity=$(bsdtar -xOf "$artifact" .PKGINFO 2>/dev/null |
+      awk -F ' = ' '$1 == "pkgname" { count++; name=$2 } END { if (count == 1) print name }')
+    [[ $package_identity =~ ^[A-Za-z0-9@._+:-]+$ ]] || {
+      print_error "Build emitted a package without one valid pkgname: $artifact_name"
+      exit 1
+    }
+    grep -Fxq "$package_identity" "$EXPECTED_OUTPUTS_FILE" || {
+      print_error "Build emitted undeclared package identity $package_identity ($artifact_name)"
+      exit 1
+    }
+    [[ $artifact_name == "$package_identity"-*.pkg.tar.* ]] || {
+      print_error "Package filename does not match its declared identity: $artifact_name"
+      exit 1
+    }
+    if grep -Fxq "$package_identity" "$SEEN_OUTPUTS_FILE"; then
+      print_error "Build emitted duplicate artifacts for package identity: $package_identity"
+      exit 1
+    fi
+    printf '%s\n' "$package_identity" >>"$SEEN_OUTPUTS_FILE"
+    ;;
+  *)
+    print_error "Build emitted an unexpected top-level artifact: $artifact_name"
+    exit 1
+    ;;
+  esac
+done
+shopt -u nullglob dotglob
+
+sort -u -o "$SEEN_OUTPUTS_FILE" "$SEEN_OUTPUTS_FILE"
+if ! cmp -s "$EXPECTED_OUTPUTS_FILE" "$SEEN_OUTPUTS_FILE"; then
+  print_error "Built package identities do not match the isolated plan"
+  diff -u "$EXPECTED_OUTPUTS_FILE" "$SEEN_OUTPUTS_FILE" || true
+  exit 1
+fi
+
+while IFS= read -r package_identity; do
+  for artifact in "$ARTIFACT_STAGING_DIR/$package_identity"-*.pkg.tar.*; do
+    install -m 0644 "$artifact" "$BUILD_OUTPUT_DIR/${artifact##*/}"
+  done
+done <"$SEEN_OUTPUTS_FILE"
+
+BUILD_RESULT=0
 
 # Summary
 echo ""

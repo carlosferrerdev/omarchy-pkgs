@@ -3,6 +3,8 @@
 
 set -e
 
+unset GPG_PRIVATE_KEY GPG_PASSPHRASE
+
 SCRIPT_DIR=$(realpath "${BASH_SOURCE[0]%/*}")
 BUILD_ROOT=$(realpath "$SCRIPT_DIR/..")
 source "$BUILD_ROOT/helpers/paths.sh"
@@ -16,11 +18,35 @@ COMMON_ARGS=()
 SYNC_ARGS=()
 while [[ $# -gt 0 ]]; do
   case $1 in
+  --arch)
+    [[ $# -ge 2 && -n $2 ]] || {
+      print_error "Option --arch requires a value"
+      exit 1
+    }
+    ARCH="$2"
+    update_arch_paths
+    COMMON_ARGS+=("$1" "$2")
+    shift 2
+    ;;
+  --mirror)
+    [[ $# -ge 2 && -n $2 ]] || {
+      print_error "Option --mirror requires a value"
+      exit 1
+    }
+    MIRROR="$2"
+    update_arch_paths
+    COMMON_ARGS+=("$1" "$2")
+    shift 2
+    ;;
   --skip-prod-check | --prune)
     SYNC_ARGS+=("$1")
     shift
     ;;
   --remote)
+    [[ $# -ge 2 && -n $2 ]] || {
+      print_error "Option --remote requires a value"
+      exit 1
+    }
     SYNC_ARGS+=("$1" "$2")
     shift 2
     ;;

@@ -1,0 +1,4 @@
+{
+  "source": "local",
+  "outputs": ["linux-t2", "linux-t2-headers"]
+}

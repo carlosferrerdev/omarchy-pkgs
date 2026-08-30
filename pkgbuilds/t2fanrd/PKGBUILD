@@ -1,0 +1,46 @@
+# Maintainer: Gomarchy maintainers
+
+pkgname=t2fanrd
+pkgver=r16.48baf96
+pkgrel=1
+pkgdesc='Fan control daemon for Apple T2 Macs'
+arch=(x86_64)
+url='https://github.com/GnomedDev/T2FanRD'
+license=(GPL-3.0-or-later)
+depends=(gcc-libs)
+makedepends=(cargo)
+conflicts=(t2fand)
+replaces=(t2fand)
+
+_commit=48baf962697ec3d4d969c74cf601ee8e15b7aeaa
+_archive="T2FanRD-$_commit"
+source=(
+  "$pkgname-$_commit.tar.gz::https://codeload.github.com/GnomedDev/T2FanRD/tar.gz/$_commit"
+  t2fanrd.service
+)
+sha256sums=(
+  33cd1644bd7602587b0d486a4396de6bdaae3d704d91e1e762604980beaa6e84
+  0487ecccbcf2f7510f9c655462d5baafc0ee6bc26a12d1742ea8f4de6df6ab3e
+)
+
+prepare() {
+  cd "$_archive"
+  export RUSTUP_TOOLCHAIN=stable
+  cargo fetch --locked --target "$CARCH-unknown-linux-gnu"
+}
+
+build() {
+  cd "$_archive"
+  export CARGO_TARGET_DIR=target
+  export RUSTUP_TOOLCHAIN=stable
+  cargo build --frozen --release
+}
+
+package() {
+  install -Dm755 "$_archive/target/release/t2fanrd" \
+    "$pkgdir/usr/bin/t2fanrd"
+  install -Dm644 t2fanrd.service \
+    "$pkgdir/usr/lib/systemd/system/t2fanrd.service"
+  install -Dm644 "$_archive/LICENCE" \
+    "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+}

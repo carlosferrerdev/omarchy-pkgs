@@ -1,85 +1,107 @@
 #!/bin/bash
-# Repository database update script (runs inside Docker container)
+# Build an unsigned repository database generation inside the build container.
+# The host signs and activates it only after this script succeeds.
 
-set -e
+set -euo pipefail
 
 ARCH=${ARCH:-x86_64}
 MIRROR=${MIRROR:-edge}
-OUTPUT_DIR="/output/$MIRROR/$ARCH"
-REPO_NAME="omarchy"
-DB_FILE="$OUTPUT_DIR/${REPO_NAME}.db.tar.zst"
+REPOSITORY_DIR=${REPOSITORY_DIR:-/repository}
+STAGING_DIR=${STAGING_DIR:-/staging}
+REPO_NAME=omarchy
 
-cd "$OUTPUT_DIR"
-
-# Remove old database files (repo-add will create new ones)
-rm -f "${REPO_NAME}.db" "${REPO_NAME}.db.tar.zst"
-rm -f "${REPO_NAME}.files" "${REPO_NAME}.files.tar.zst"
-
-# Check if there are any packages
-if ! ls *.pkg.tar.* 1>/dev/null 2>&1; then
-  echo "==> No packages found in $OUTPUT_DIR"
-  echo "==> Run bin/repo build first to build packages"
+case "$ARCH" in
+  x86_64|aarch64) ;;
+  *) echo "ERROR: unsupported architecture: $ARCH" >&2; exit 1 ;;
+esac
+case "$MIRROR" in
+  edge|rc|stable) ;;
+  *) echo "ERROR: unsupported mirror: $MIRROR" >&2; exit 1 ;;
+esac
+[[ -d $REPOSITORY_DIR && ! -L $REPOSITORY_DIR ]] || {
+  echo "ERROR: repository directory is missing or unsafe: $REPOSITORY_DIR" >&2
+  exit 1
+}
+[[ -d $STAGING_DIR && ! -L $STAGING_DIR ]] || {
+  echo "ERROR: staging directory is missing or unsafe: $STAGING_DIR" >&2
+  exit 1
+}
+if [[ -n $(find "$STAGING_DIR" -mindepth 1 -maxdepth 1 -print -quit) ]]; then
+  echo "ERROR: staging directory is not empty: $STAGING_DIR" >&2
   exit 1
 fi
 
-# Add all packages to the database (only latest version of each)
-echo "==> Adding packages to database..."
-
-# Build list of latest packages using vercmp for proper version sorting
-declare -A latest_pkgs
-declare -A latest_vers
-
-# Helper to extract pkgname and version from filename
-# Uses bsdtar to read .PKGINFO for accurate info
 get_pkg_info() {
-  local pkg="$1"
-  bsdtar -xOqf "$pkg" .PKGINFO 2>/dev/null | awk '
+  local package_file="$1"
+
+  bsdtar -xOqf "$package_file" .PKGINFO 2>/dev/null | awk '
     /^pkgname = / { name = substr($0, 11) }
-    /^pkgver = / { ver = substr($0, 10) }
-    END { print name " " ver }
+    /^pkgver = / { version = substr($0, 10) }
+    END {
+      if (name == "" || version == "") exit 1
+      print name " " version
+    }
   '
 }
 
-for pkg in *.pkg.tar.*; do
-  [[ "$pkg" == *.sig ]] && continue
-  [[ ! -f "$pkg" ]] && continue
-  
-  read -r name ver <<< "$(get_pkg_info "$pkg")"
-  [[ -z "$name" ]] && continue
-  
-  if [[ -z "${latest_pkgs[$name]}" ]]; then
-    latest_pkgs[$name]="$pkg"
-    latest_vers[$name]="$ver"
-  else
-    if [[ $(vercmp "$ver" "${latest_vers[$name]}") -gt 0 ]]; then
-      latest_pkgs[$name]="$pkg"
-      latest_vers[$name]="$ver"
-    fi
+shopt -s nullglob
+package_candidates=("$REPOSITORY_DIR"/*.pkg.tar.*)
+shopt -u nullglob
+
+declare -A latest_packages=()
+declare -A latest_versions=()
+package_count=0
+
+for package_file in "${package_candidates[@]}"; do
+  [[ $package_file == *.sig ]] && continue
+  [[ -f $package_file && ! -L $package_file ]] || {
+    echo "ERROR: package is not a regular non-symlink file: $package_file" >&2
+    exit 1
+  }
+  [[ -f $package_file.sig && ! -L $package_file.sig ]] || {
+    echo "ERROR: package has no regular non-symlink signature: $package_file" >&2
+    exit 1
+  }
+  if ! read -r package_name package_version < <(get_pkg_info "$package_file"); then
+    echo "ERROR: package metadata is unreadable: $package_file" >&2
+    exit 1
+  fi
+  [[ -n $package_name && -n $package_version ]] || {
+    echo "ERROR: package metadata is incomplete: $package_file" >&2
+    exit 1
+  }
+  package_count=$((package_count + 1))
+
+  if [[ -z ${latest_packages[$package_name]+x} ]] ||
+    [[ $(vercmp "$package_version" "${latest_versions[$package_name]}") -gt 0 ]]; then
+    latest_packages[$package_name]=$package_file
+    latest_versions[$package_name]=$package_version
   fi
 done
 
-# Add latest packages to repo
-for pkg in "${latest_pkgs[@]}"; do
-  echo "  Adding: $pkg"
-done | sort
+if (( package_count == 0 || ${#latest_packages[@]} == 0 )); then
+  echo "ERROR: no signed packages found in $REPOSITORY_DIR" >&2
+  exit 1
+fi
 
-repo-add "$DB_FILE" "${latest_pkgs[@]}" || {
-  echo "==> Failed to update repository database"
+mapfile -t selected_packages < <(printf '%s\n' "${latest_packages[@]}" | sort)
+printf '==> Building staged repository database from %d package(s)\n' "${#selected_packages[@]}"
+printf '  Adding: %s\n' "${selected_packages[@]}"
+
+repo-add "$STAGING_DIR/$REPO_NAME.db.tar.zst" "${selected_packages[@]}" || {
+  echo "ERROR: repo-add failed while building the staged repository database" >&2
   exit 1
 }
 
-# Create symlinks for compatibility
-ln -sf "${REPO_NAME}.db.tar.zst" "${REPO_NAME}.db"
-ln -sf "${REPO_NAME}.files.tar.zst" "${REPO_NAME}.files"
-
-# Count packages
-PACKAGE_COUNT=$(ls -1 *.pkg.tar.* 2>/dev/null | grep -v '\.sig$' | wc -l)
-
-echo "==> Database updated successfully!"
-echo "==> Total packages in repository: $PACKAGE_COUNT"
-
-# List packages in database
-echo "==> Packages in database:"
-tar -tf "$DB_FILE" 2>/dev/null | grep -E "^[^/]+/$" | sed 's|/$||' | sort -u | while read -r pkg; do
-  echo "  - $pkg"
+for artifact in "$REPO_NAME.db.tar.zst" "$REPO_NAME.files.tar.zst"; do
+  [[ -s $STAGING_DIR/$artifact && ! -L $STAGING_DIR/$artifact ]] || {
+    echo "ERROR: repo-add did not produce a regular non-empty $artifact" >&2
+    exit 1
+  }
 done
+
+rm -f -- "$STAGING_DIR/$REPO_NAME.db" "$STAGING_DIR/$REPO_NAME.files"
+ln -s "$REPO_NAME.db.tar.zst" "$STAGING_DIR/$REPO_NAME.db"
+ln -s "$REPO_NAME.files.tar.zst" "$STAGING_DIR/$REPO_NAME.files"
+
+echo "==> Staged repository database created successfully"

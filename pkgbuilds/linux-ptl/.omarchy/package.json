@@ -1,4 +1,5 @@
 {
   "source": "local",
+  "outputs": ["linux-ptl", "linux-ptl-headers"],
   "skip_build": true
 }
