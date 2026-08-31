@@ -153,6 +153,14 @@ package() {
   install -Dm644 default/gnome-shell/modes/gomarchy.json "$pkgdir/usr/share/gnome-shell/modes/gomarchy.json"
   install -Dm644 default/gnome-session/sessions/gomarchy.session "$pkgdir/usr/share/gnome-session/sessions/gomarchy.session"
   install -Dm644 default/wayland-sessions/gomarchy-gnome.desktop "$pkgdir/usr/share/wayland-sessions/gomarchy-gnome.desktop"
+  # The masks land with the next pinned Gomarchy release. Keep the current
+  # stable PKGBUILD buildable while its source commit predates these files.
+  if [[ -f default/wayland-sessions/hyprland.desktop ]]; then
+    install -Dm644 default/wayland-sessions/hyprland.desktop "$pkgdir/usr/local/share/wayland-sessions/hyprland.desktop"
+  fi
+  if [[ -f default/wayland-sessions/hyprland-uwsm.desktop ]]; then
+    install -Dm644 default/wayland-sessions/hyprland-uwsm.desktop "$pkgdir/usr/local/share/wayland-sessions/hyprland-uwsm.desktop"
+  fi
   install -Dm644 default/systemd/user/gnome-session@gomarchy.target.d/gomarchy.session.conf \
     "$pkgdir/usr/lib/systemd/user/gnome-session@gomarchy.target.d/gomarchy.session.conf"
   install -Dm644 default/fontconfig/conf.avail/50-omarchy.conf "$pkgdir/usr/share/fontconfig/conf.avail/50-omarchy.conf"
