@@ -1,5 +1,8 @@
 {
   "source": "aur",
-  "outputs": ["lib32-nvidia-580xx-utils", "lib32-opencl-nvidia-580xx"],
+  "outputs": [
+    "lib32-nvidia-580xx-utils",
+    "lib32-opencl-nvidia-580xx"
+  ],
   "upstream_commit": "bbe7b771c897f78e518ab4453b0bc9210ef2f201"
 }

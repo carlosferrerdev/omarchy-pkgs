@@ -1,5 +1,9 @@
 {
   "source": "aur",
-  "outputs": ["nvidia-580xx-utils", "opencl-nvidia-580xx", "nvidia-580xx-dkms"],
+  "outputs": [
+    "nvidia-580xx-utils",
+    "opencl-nvidia-580xx",
+    "nvidia-580xx-dkms"
+  ],
   "upstream_commit": "85c38619ce2267787d0515baa443739cb9d2883c"
 }

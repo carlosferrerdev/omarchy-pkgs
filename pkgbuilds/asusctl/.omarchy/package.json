@@ -1,5 +1,8 @@
 {
   "source": "aur",
-  "outputs": ["asusctl", "rog-control-center"],
+  "outputs": [
+    "asusctl",
+    "rog-control-center"
+  ],
   "upstream_commit": "ed336f7dbd5e8bee333aeaa6246da89241f1c8e6"
 }
