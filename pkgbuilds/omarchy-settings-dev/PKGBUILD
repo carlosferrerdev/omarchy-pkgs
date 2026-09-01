@@ -144,7 +144,7 @@ package() {
   # ~/.config/environment.d, ~/.config/fontconfig, ~/.config/xdg-terminals.list,
   # ~/.config/mimeapps.list, and ~/.config/systemd/user can all override these.
   install -Dm644 default/uwsm/env.d/10-omarchy "$pkgdir/usr/share/uwsm/env.d/10-omarchy"
-  install -Dm644 default/environment.d/10-omarchy-fcitx.conf "$pkgdir/usr/lib/environment.d/10-omarchy-fcitx.conf"
+  install -Dm644 default/omarchy/uwsm-fcitx.env "$pkgdir/usr/share/uwsm/env.d/20-omarchy-fcitx"
   install -Dm644 default/environment.d/20-omarchy-session.conf "$pkgdir/usr/lib/environment.d/20-omarchy-session.conf"
   install -Dm755 default/systemd/user-environment-generators/60-omarchy-dev-path \
     "$pkgdir/usr/lib/systemd/user-environment-generators/60-omarchy-dev-path"
